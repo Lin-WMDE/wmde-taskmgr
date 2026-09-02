@@ -4,13 +4,12 @@
 
 use std::borrow::Cow;
 
+use cosmic::widget::Icon;
 use cosmic::widget::table::{ItemCategory, ItemInterface};
-use cosmic::widget::{Icon, icon};
 use cosmic::iced::{Length, alignment::Horizontal};
 
 use crate::fl;
 use crate::probe::Process;
-use crate::windows::Window;
 
 /// The columns, in the order the list shows them.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -93,9 +92,6 @@ pub struct Row {
     pub kind: Kind,
     /// Processes this row would end. Empty for a section heading.
     pub pids: Vec<u32>,
-    /// The icon name for an application row.
-    icon_name: Option<String>,
-
     name: String,
     cpu: String,
     memory: String,
@@ -116,17 +112,12 @@ pub struct Row {
 impl Row {
     /// One process.
     ///
-    /// Named by `comm`, the way the reference's details view names a process. A process that
-    /// owns a window also carries that application's icon, which is the only thing the
-    /// compositor's window list is used for in a flat list.
+    /// Named by `comm`, the way the reference's details view names a process.
     #[must_use]
-    pub fn process(p: &Process, window: Option<&Window>) -> Self {
+    pub fn process(p: &Process) -> Self {
         Self {
             kind: Kind::Process,
             pids: vec![p.pid],
-            icon_name: window
-                .map(|w| w.app_id.clone())
-                .filter(|id| !id.is_empty()),
             name: p.name.to_string(),
             cpu: percent(p.cpu),
             memory: size(p.rss),
@@ -157,7 +148,6 @@ impl Row {
         Self {
             kind: Kind::Account,
             name: format!("{name} ({})", pids.len()),
-            icon_name: None,
             cpu: percent(cpu),
             memory: size(rss),
             data: size(data),
@@ -189,13 +179,10 @@ impl Row {
 }
 
 impl ItemInterface<Column> for Row {
-    fn get_icon(&self, category: Column) -> Option<Icon> {
-        if category != Column::Name {
-            return None;
-        }
-        self.icon_name
-            .as_ref()
-            .map(|name| icon::from_name(name.as_str()).icon())
+    /// No icons in this list. Most processes have none, and the ragged indent a handful of
+    /// icons produced was worse than the little they told.
+    fn get_icon(&self, _category: Column) -> Option<Icon> {
+        None
     }
 
     fn get_text(&self, category: Column) -> Cow<'static, str> {

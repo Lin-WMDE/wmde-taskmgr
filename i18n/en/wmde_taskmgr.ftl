@@ -50,3 +50,7 @@ summary-disk = read { $read }, write { $write }
 summary-network = in { $rx }, out { $tx }
 
 search = Search
+
+scope-mine = My processes
+scope-users = All users
+scope-all = Including kernel

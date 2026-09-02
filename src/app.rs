@@ -21,6 +21,34 @@ use crate::windows::{self, Event, Window};
 /// walk of 1604 processes costs 31 ms, so a second leaves the machine alone between ticks.
 const TICK: Duration = Duration::from_secs(1);
 
+/// How much of the machine the process list shows.
+///
+/// One control instead of two checkboxes: the levels nest, and a pair of tick boxes has a
+/// state that means nothing - "only mine" already excludes every kernel thread, because they
+/// all belong to root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Scope {
+    /// Processes of the person at the machine.
+    #[default]
+    Mine,
+    /// Every process with a command line of its own, whoever owns it.
+    Users,
+    /// Kernel threads as well.
+    All,
+}
+
+impl Scope {
+    const ALL: [Self; 3] = [Self::Mine, Self::Users, Self::All];
+
+    fn label(self) -> String {
+        match self {
+            Self::Mine => fl!("scope-mine"),
+            Self::Users => fl!("scope-users"),
+            Self::All => fl!("scope-all"),
+        }
+    }
+}
+
 /// The tabs, in the order the rail lists them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Page {
@@ -46,6 +74,8 @@ pub enum Message {
     /// The search box changed.
     Search(String),
     SearchClear,
+    /// The scope control changed, by position in [`Scope::ALL`].
+    Scope(usize),
     Sort(Column),
     EndTask { force: bool },
     DismissError,
@@ -84,6 +114,9 @@ pub struct App {
     uid: u32,
     /// Quick search over the name, the command line and the pid.
     search: String,
+    scope: Scope,
+    /// Built once: the dropdown wants a slice that outlives the view.
+    scope_labels: Vec<String>,
     /// The column the list is ordered by, and whether the natural order is reversed. Natural
     /// means largest first for a number and alphabetical for a name, which is the order each
     /// column is actually read in.
@@ -121,20 +154,26 @@ impl App {
         self.generation = self.generation.wrapping_add(1);
         let (column, reversed) = self.sort;
 
-        let window_of: HashMap<u32, &crate::windows::Window> =
-            self.windows.iter().map(|w| (w.pid, w)).collect();
         let needle = self.search.trim().to_lowercase();
+        let scope = self.scope;
+        let uid = self.uid;
 
         let mut rows: Vec<Row> = self
             .probe
             .processes()
+            .filter(|p| match scope {
+                // A kernel thread belongs to root, so this covers them too.
+                Scope::Mine => p.uid == uid,
+                Scope::Users => !p.is_kernel_thread(),
+                Scope::All => true,
+            })
             .filter(|p| {
                 needle.is_empty()
                     || p.name.to_lowercase().contains(&needle)
                     || p.cmdline.to_lowercase().contains(&needle)
                     || p.pid.to_string().contains(&needle)
             })
-            .map(|p| Row::process(p, window_of.get(&p.pid).copied()))
+            .map(Row::process)
             .collect();
         rows.sort_by(|a, b| {
             let order = crate::processes::compare(a, b, column);
@@ -197,6 +236,18 @@ impl App {
             .on_input(Message::Search)
             .on_clear(Message::SearchClear);
 
+        let scope = widget::dropdown(
+            &self.scope_labels,
+            Scope::ALL.iter().position(|s| *s == self.scope),
+            Message::Scope,
+        );
+
+        let bar = widget::row::with_capacity(2)
+            .spacing(spacing.space_xs)
+            .align_y(cosmic::iced::Alignment::Center)
+            .push(search)
+            .push(scope);
+
         let table = widget::table(&self.table)
             .on_item_left_click(move |entity| Message::Select(generation, entity))
             // Right click selects too, so the menu below always acts on the row it was
@@ -220,7 +271,7 @@ impl App {
 
         let mut column = widget::column::with_capacity(3)
             .spacing(spacing.space_xxs)
-            .push(search)
+            .push(bar)
             .push(table);
         if let Some(error) = &self.error {
             column = column.push(widget::warning(error.clone()).on_close(Message::DismissError));
@@ -270,6 +321,8 @@ impl cosmic::Application for App {
             windows: Vec::new(),
             uid: rustix::process::getuid().as_raw(),
             search: String::new(),
+            scope: Scope::default(),
+            scope_labels: Scope::ALL.iter().map(|s| s.label()).collect(),
             // Memory first: it is the column the list is opened for.
             sort: (Column::Data, false),
             table: table::Model::new(Column::ALL.to_vec()),
@@ -311,10 +364,9 @@ impl cosmic::Application for App {
                 self.rebuild_users();
                 self.performance.tick();
             }
-            Message::Bus(Event::Windows(windows)) => {
-                self.windows = windows;
-                self.rebuild();
-            }
+            // Kept, not used: the flat list needs nothing from it, and the folding in
+            // `group` needs all of it the moment it is wired back up.
+            Message::Bus(Event::Windows(windows)) => self.windows = windows,
             Message::Bus(Event::Present) => {
                 if let Some(id) = self.core.main_window_id() {
                     return cosmic::iced::window::gain_focus(id);
@@ -338,6 +390,10 @@ impl cosmic::Application for App {
             }
             Message::SearchClear => {
                 self.search.clear();
+                self.rebuild();
+            }
+            Message::Scope(index) => {
+                self.scope = Scope::ALL.get(index).copied().unwrap_or_default();
                 self.rebuild();
             }
             Message::Sort(column) => {
@@ -409,6 +465,46 @@ impl widget::menu::Action for Action {
             Self::EndTask => Message::EndTask { force: false },
             Self::KillTask => Message::EndTask { force: true },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The levels nest: what "mine" shows is a subset of the user processes, which is a
+    /// subset of everything. A pair of checkboxes would allow a state that says otherwise.
+    #[test]
+    fn the_scopes_nest() {
+        let mut probe = Probe::new();
+        probe.sample();
+        let uid = rustix::process::getuid().as_raw();
+
+        let count = |scope: Scope| {
+            probe
+                .processes()
+                .filter(|p| match scope {
+                    Scope::Mine => p.uid == uid,
+                    Scope::Users => !p.is_kernel_thread(),
+                    Scope::All => true,
+                })
+                .count()
+        };
+
+        assert!(count(Scope::Mine) > 0, "the test process is one of ours");
+        assert!(count(Scope::Mine) <= count(Scope::Users));
+        assert!(count(Scope::Users) < count(Scope::All), "a live system has kernel threads");
+    }
+
+    /// Every scope has a label in the catalogue, and no two read the same.
+    #[test]
+    fn every_scope_is_named() {
+        let labels: Vec<String> = Scope::ALL.iter().map(|s| s.label()).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two scopes share a label");
     }
 }
 

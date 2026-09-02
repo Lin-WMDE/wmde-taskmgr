@@ -50,3 +50,7 @@ summary-disk = читання { $read }, запис { $write }
 summary-network = прийом { $rx }, передача { $tx }
 
 search = Пошук
+
+scope-mine = Мої процеси
+scope-users = Усі користувацькі
+scope-all = Разом із ядерними
