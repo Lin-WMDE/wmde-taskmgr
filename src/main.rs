@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 mod app;
+mod group;
 mod localize;
+mod probe;
+mod windows;
 
 fn main() -> cosmic::iced::Result {
     tracing_subscriber::fmt()
