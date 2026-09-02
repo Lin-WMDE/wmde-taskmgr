@@ -8,7 +8,7 @@ use std::time::Duration;
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::{Length, Subscription};
 use cosmic::prelude::*;
-use cosmic::widget::{self, nav_bar, table};
+use cosmic::widget::{self, segmented_button, table};
 
 use crate::fl;
 use crate::performance::{self, Performance};
@@ -76,6 +76,8 @@ pub enum Message {
     SearchClear,
     /// The scope control changed, by position in [`Scope::ALL`].
     Scope(usize),
+    /// A tab in the title bar was picked.
+    Tab(segmented_button::Entity),
     Sort(Column),
     EndTask { force: bool },
     DismissError,
@@ -107,7 +109,7 @@ impl Selection {
 
 pub struct App {
     core: Core,
-    nav: nav_bar::Model,
+    tabs: segmented_button::SingleSelectModel,
     probe: Probe,
     windows: Vec<Window>,
     /// The person at the machine. Everything else is a system process.
@@ -140,7 +142,7 @@ pub struct App {
 
 impl App {
     fn page(&self) -> Page {
-        self.nav
+        self.tabs
             .active_data::<Page>()
             .copied()
             .unwrap_or(Page::Processes)
@@ -218,6 +220,20 @@ impl App {
     /// Read out of the item map. `active_data` reads the model's `storage` map, which only
     /// `EntityMut::data()` ever fills, and the rows here are inserted without it - so that
     /// call returned `None` for every row and left the header button dead.
+    /// Hand the machine-wide figures to the column headings.
+    fn publish_totals(&self) {
+        let s = self.performance.last();
+        crate::processes::set_totals(crate::processes::Totals {
+            cpu: s.cpu.iter().sum(),
+            memory: if s.mem_total > 0 {
+                s.mem[0] as f32 / s.mem_total as f32
+            } else {
+                0.0
+            },
+            disk: s.disk[0] + s.disk[1],
+        });
+    }
+
     fn rebuild_users(&mut self) {
         let mut model = table::Model::new(Column::ALL.to_vec());
         for row in users::rows(&self.probe, &self.user_names, self.user_range, self.uid) {
@@ -299,24 +315,23 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let mut nav = nav_bar::Model::default();
-        nav.insert()
-            .text(fl!("processes"))
-            .icon(widget::icon::from_name("view-list-symbolic"))
-            .data(Page::Processes);
-        nav.insert()
-            .text(fl!("performance"))
-            .icon(widget::icon::from_name("utilities-system-monitor-symbolic"))
-            .data(Page::Performance);
-        nav.insert()
-            .text(fl!("users"))
-            .icon(widget::icon::from_name("system-users-symbolic"))
-            .data(Page::Users);
-        nav.activate_position(0);
+        let mut tabs = segmented_button::ModelBuilder::default();
+        for (label, page) in [
+            (fl!("processes"), Page::Processes),
+            (fl!("performance"), Page::Performance),
+            (fl!("users"), Page::Users),
+        ] {
+            tabs = tabs.insert(move |b| b.text(label).data(page));
+        }
+        let mut tabs = tabs.build();
+        let first = tabs.iter().next();
+        if let Some(first) = first {
+            tabs.activate(first);
+        }
 
         let mut app = App {
             core,
-            nav,
+            tabs,
             probe: Probe::new(),
             windows: Vec::new(),
             uid: rustix::process::getuid().as_raw(),
@@ -347,21 +362,35 @@ impl cosmic::Application for App {
         (app, title)
     }
 
-    fn nav_model(&self) -> Option<&nav_bar::Model> {
-        Some(&self.nav)
-    }
-
-    fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Self::Message> {
-        self.nav.activate(id);
-        Task::none()
+    /// Tabs at the left of the title bar, the way the terminal and Files carry theirs.
+    ///
+    /// Known and accepted: the header bar wraps its whole width in a `mouse_area` that starts
+    /// a window move as soon as the pointer travels a single pixel, and a segmented button
+    /// only activates on release. A click with any drag in it therefore moves the window
+    /// instead of switching tabs. Both other apps behave the same way; fixing it means one
+    /// line in libcosmic and a rebuild of the whole stack.
+    fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
+        vec![
+            widget::tab_bar::horizontal(&self.tabs)
+                .button_height(32)
+                .style(crate::tabs::style())
+                .on_activate(Message::Tab)
+                .width(Length::Shrink)
+                .into(),
+        ]
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Tick => {
                 self.probe.sample();
+                self.publish_totals();
                 self.rebuild();
                 self.rebuild_users();
+                self.performance.counts = (
+                    self.probe.processes().count(),
+                    self.probe.processes().map(|p| p.threads).sum(),
+                );
                 self.performance.tick();
             }
             // Kept, not used: the flat list needs nothing from it, and the folding in
@@ -392,6 +421,7 @@ impl cosmic::Application for App {
                 self.search.clear();
                 self.rebuild();
             }
+            Message::Tab(entity) => self.tabs.activate(entity),
             Message::Scope(index) => {
                 self.scope = Scope::ALL.get(index).copied().unwrap_or_default();
                 self.rebuild();

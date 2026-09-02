@@ -54,3 +54,13 @@ search = Пошук
 scope-mine = Мої процеси
 scope-users = Усі користувацькі
 scope-all = Разом із ядерними
+
+fact-utilization = Завантаження
+fact-processes = Процесів
+fact-threads = Потоків
+fact-uptime = Час роботи
+fact-cpus = Логічних процесорів
+fact-sockets = Сокетів
+fact-virtual = Віртуальна машина
+fact-yes = Так
+fact-no = Ні

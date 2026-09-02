@@ -9,6 +9,7 @@ use cosmic::widget;
 use wmde_sysmon::graph::{Colors, Kind, Metrics, Ring, Strip, Style};
 use wmde_sysmon::probe::{Probe, Sample, Sources};
 
+use crate::facts::Facts;
 use crate::fl;
 
 /// Seconds of history, which is what the reference shows and labels.
@@ -25,6 +26,7 @@ const TILE_MIN_HEIGHT: f32 = 90.0;
 const THUMB_WIDTH: f32 = 60.0;
 const THUMB_HEIGHT: f32 = 34.0;
 const RAIL_WIDTH: f32 = 220.0;
+const FACTS_WIDTH: f32 = 190.0;
 /// Per-core plots to a line, as the reference lays them out.
 const TILE_COLUMNS: usize = 4;
 
@@ -85,6 +87,11 @@ pub struct Performance {
     colors: Colors,
     pub device: Device,
     pub per_core: bool,
+    /// What the machine is, read once.
+    facts: Facts,
+    /// Processes and threads as of the last walk, handed in by the application: this half
+    /// samples the machine, not `/proc/*/`.
+    pub counts: (usize, u32),
 }
 
 impl Default for Performance {
@@ -107,6 +114,8 @@ impl Performance {
             // The reference opens on the tiles, and a machine busy on one core out of sixteen
             // reads as idle on the aggregate.
             per_core: true,
+            facts: Facts::load(),
+            counts: (0, 0),
         }
     }
 
@@ -251,12 +260,69 @@ impl Performance {
             );
         }
 
-        widget::row::with_capacity(2)
+        let mut row = widget::row::with_capacity(3)
             .spacing(spacing.space_s)
             .padding(spacing.space_s)
             .push(widget::container(rail).width(Length::Fixed(RAIL_WIDTH)))
-            .push(widget::container(main).width(Length::Fill))
-            .into()
+            .push(widget::container(main).width(Length::Fill));
+        if self.device == Device::Cpu {
+            row = row.push(widget::container(self.facts_panel()).width(Length::Fixed(FACTS_WIDTH)));
+        }
+        row.into()
+    }
+
+    /// The last sample, for whoever needs the machine-wide figures.
+    #[must_use]
+    pub fn last(&self) -> &Sample {
+        &self.last
+    }
+
+    /// What the machine is doing, and beside it what the machine is.
+    fn facts_panel(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let busy: f32 = self.last.cpu.iter().sum();
+        let (processes, threads) = self.counts;
+
+        let pair = |label: String, value: String| {
+            widget::column::with_capacity(2)
+                .push(widget::text::caption(label))
+                .push(widget::text::body(value))
+        };
+        let line = |label: String, value: String| {
+            widget::row::with_capacity(2)
+                .spacing(spacing.space_xxs)
+                .push(widget::text::caption(label).width(Length::Fill))
+                .push(widget::text::caption(value))
+        };
+
+        let mut panel = widget::column::with_capacity(12)
+            .spacing(spacing.space_xxs)
+            .push(pair(
+                fl!("fact-utilization"),
+                format!("{:.0}%", busy * 100.0),
+            ))
+            .push(pair(fl!("fact-processes"), processes.to_string()))
+            .push(pair(fl!("fact-threads"), threads.to_string()))
+            .push(pair(fl!("fact-uptime"), uptime()));
+
+        if !self.facts.model.is_empty() {
+            panel = panel.push(widget::text::caption(self.facts.model.clone()));
+        }
+        panel = panel
+            .push(line(fl!("fact-cpus"), self.facts.cpus.to_string()))
+            .push(line(fl!("fact-sockets"), self.facts.sockets.to_string()))
+            .push(line(
+                fl!("fact-virtual"),
+                if self.facts.virtualized {
+                    fl!("fact-yes")
+                } else {
+                    fl!("fact-no")
+                },
+            ));
+        for (level, size) in &self.facts.caches {
+            panel = panel.push(line(level.clone(), size.clone()));
+        }
+        panel.into()
     }
 
     /// One plot per logical processor, filling the height the page has to give.
@@ -322,6 +388,16 @@ impl Performance {
 fn last_seconds() -> String {
     let count = WINDOW as i64;
     fl!("last-seconds", count = count)
+}
+
+/// How long the machine has been up, as the reference writes it: `d:hh:mm:ss`.
+fn uptime() -> String {
+    let secs = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0) as u64;
+    let (d, h, m, s) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    format!("{d}:{h:02}:{m:02}:{s:02}")
 }
 
 /// Bytes as the largest unit that leaves a number worth reading.

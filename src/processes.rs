@@ -36,9 +36,59 @@ impl Column {
     ];
 }
 
+/// What the whole machine is doing, written into the column headings.
+///
+/// Taken from the reference: the total sits where the column it totals is, so a glance at the
+/// heading answers "is anything busy" without leaving the list.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Totals {
+    /// Share of the machine, 0.0 to 1.0.
+    pub cpu: f32,
+    /// Share of physical memory held, 0.0 to 1.0.
+    pub memory: f32,
+    /// Bytes per second to and from storage.
+    pub disk: f64,
+}
+
+/// Written into the headings on the next view. A `Display` implementation has nowhere to take
+/// an argument, and the table asks the category to name itself.
+static TOTALS: std::sync::RwLock<Totals> = std::sync::RwLock::new(Totals {
+    cpu: 0.0,
+    memory: 0.0,
+    disk: 0.0,
+});
+
+pub fn set_totals(totals: Totals) {
+    if let Ok(mut slot) = TOTALS.write() {
+        *slot = totals;
+    }
+}
+
+impl Column {
+    /// The machine-wide figure this column heads, or nothing for a column that has none.
+    fn total(self) -> Option<String> {
+        let totals = TOTALS.read().ok()?;
+        match self {
+            Self::Cpu => Some(format!("{:.0}%", totals.cpu * 100.0)),
+            Self::Memory => Some(format!("{:.0}%", totals.memory * 100.0)),
+            Self::Disk => Some(rate(Some([totals.disk, 0.0]))),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&match self {
+        if let Some(total) = self.total() {
+            return write!(f, "{}  {total}", self.title());
+        }
+        f.write_str(&self.title())
+    }
+}
+
+impl Column {
+    fn title(self) -> String {
+        match self {
             Self::Name => fl!("column-name"),
             Self::Cpu => fl!("column-cpu"),
             Self::Memory => fl!("column-memory"),
@@ -46,7 +96,7 @@ impl std::fmt::Display for Column {
             Self::Disk => fl!("column-disk"),
             Self::Threads => fl!("column-threads"),
             Self::Pid => fl!("column-pid"),
-        })
+        }
     }
 }
 

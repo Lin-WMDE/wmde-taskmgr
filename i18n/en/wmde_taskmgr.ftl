@@ -54,3 +54,13 @@ search = Search
 scope-mine = My processes
 scope-users = All users
 scope-all = Including kernel
+
+fact-utilization = Utilization
+fact-processes = Processes
+fact-threads = Threads
+fact-uptime = Up time
+fact-cpus = Logical processors
+fact-sockets = Sockets
+fact-virtual = Virtual machine
+fact-yes = Yes
+fact-no = No

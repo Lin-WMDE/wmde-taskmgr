@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 mod app;
+mod facts;
 mod group;
 mod localize;
 mod performance;
 mod probe;
 mod processes;
 mod single;
+mod tabs;
 mod users;
 mod windows;
 
