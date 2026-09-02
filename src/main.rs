@@ -3,8 +3,10 @@
 mod app;
 mod group;
 mod localize;
+mod performance;
 mod probe;
 mod processes;
+mod users;
 mod windows;
 
 fn main() -> cosmic::iced::Result {

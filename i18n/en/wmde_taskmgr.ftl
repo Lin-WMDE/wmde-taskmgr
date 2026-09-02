@@ -38,3 +38,17 @@ rate-mib = { $value } MiB/s
 rate-gib = { $value } GiB/s
 
 no-value = -
+
+device-cpu = CPU
+device-memory = Memory
+device-disk = Disk
+device-network = Network
+
+last-seconds = last { $count } seconds
+show-per-core = Per logical processor
+show-overall = Overall
+
+summary-cpu = { $value }
+summary-memory = { $used } of { $total }
+summary-disk = read { $read }, write { $write }
+summary-network = in { $rx }, out { $tx }

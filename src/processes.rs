@@ -181,6 +181,43 @@ impl Row {
         }
     }
 
+    /// A row for one account on the users page. It is a group of processes like any other,
+    /// but keyed by nothing: the users page does not unfold.
+    #[must_use]
+    pub fn user(
+        name: String,
+        pids: Vec<u32>,
+        cpu: f32,
+        rss: u64,
+        data: u64,
+        threads: u32,
+        disk: Option<[f64; 2]>,
+    ) -> Self {
+        let count = pids.len() as i64;
+        Self {
+            kind: Kind::Group {
+                expanded: false,
+                expandable: false,
+            },
+            key: None,
+            name: format!("{name} - {}", fl!("process-count", count = count)),
+            icon_name: None,
+            cpu: percent(cpu),
+            memory: size(rss),
+            data: size(data),
+            disk: rate(disk),
+            threads: threads.to_string(),
+            pid: fl!("no-value"),
+            sort_cpu: cpu,
+            sort_memory: rss,
+            sort_data: data,
+            sort_disk: disk.map_or(0.0, |d| d[0] + d[1]),
+            sort_threads: threads,
+            sort_pid: 0,
+            pids,
+        }
+    }
+
     #[must_use]
     pub fn child(p: &Process) -> Self {
         Self {

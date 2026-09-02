@@ -13,7 +13,9 @@ use cosmic::widget::{self, nav_bar, table};
 use crate::fl;
 use crate::group::{self, Group, Section};
 use crate::probe::Probe;
+use crate::performance::{self, Performance};
 use crate::processes::{Column, Kind, Row};
+use crate::users::{self, Names};
 use crate::windows::{self, Window};
 
 /// How often the list is rebuilt. The reference calls this speed "normal", and a release
@@ -40,6 +42,7 @@ pub enum Message {
     Sort(Column),
     EndTask { force: bool },
     DismissError,
+    Performance(performance::Message),
 }
 
 pub struct App {
@@ -59,6 +62,11 @@ pub struct App {
     /// table is rebuilt from scratch every tick.
     selected: Vec<u32>,
     error: Option<String>,
+    performance: Performance,
+    /// Read once: an account added while the window is open is vanishingly rare, and
+    /// re-reading `/etc/passwd` every second is not the way to catch it.
+    user_names: Names,
+    users: table::SingleSelectModel<Row, Column>,
 }
 
 impl App {
@@ -125,6 +133,15 @@ impl App {
         }
 
         self.table = model;
+    }
+
+    fn rebuild_users(&mut self) {
+        let mut model = table::Model::new(Column::ALL.to_vec());
+        for row in users::rows(&self.probe, &self.user_names) {
+            let _ = model.insert(row);
+        }
+        model.set_sort(Some((Column::Data, false)));
+        self.users = model;
     }
 
     fn active_row(&self) -> Option<&Row> {
@@ -210,12 +227,17 @@ impl cosmic::Application for App {
             table: table::Model::new(Column::ALL.to_vec()),
             selected: Vec::new(),
             error: None,
+            performance: Performance::new(),
+            user_names: Names::load(),
+            users: table::Model::new(Column::ALL.to_vec()),
         };
         // The first walk has nothing to take a delta against, so every rate reads zero until
         // the second one a second later. Taking it here means the window is not empty when
         // it opens.
         app.probe.sample();
         app.rebuild();
+        app.rebuild_users();
+        app.performance.tick();
 
         let title = app.set_window_title(fl!("app-title"), app.core.main_window_id().unwrap());
         (app, title)
@@ -247,6 +269,8 @@ impl cosmic::Application for App {
             Message::Tick => {
                 self.probe.sample();
                 self.rebuild();
+                self.rebuild_users();
+                self.performance.tick();
             }
             Message::Windows(windows) => {
                 self.windows = windows;
@@ -291,6 +315,12 @@ impl cosmic::Application for App {
                 }
             }
             Message::DismissError => self.error = None,
+            Message::Performance(message) => match message {
+                performance::Message::Select(device) => self.performance.device = device,
+                performance::Message::TogglePerCore => {
+                    self.performance.per_core = !self.performance.per_core;
+                }
+            },
         }
         Task::none()
     }
@@ -298,9 +328,12 @@ impl cosmic::Application for App {
     fn view(&self) -> Element<'_, Message> {
         match self.page() {
             Page::Processes => self.processes_view(),
-            // Both land in the next steps; an empty page beats a page that lies.
-            Page::Performance => widget::text::body(fl!("performance")).into(),
-            Page::Users => widget::text::body(fl!("users")).into(),
+            Page::Performance => self.performance.view().map(Message::Performance),
+            Page::Users => widget::table(&self.users)
+                .apply(widget::scrollable)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
         }
     }
 

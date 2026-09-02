@@ -39,3 +39,17 @@ rate-mib = { $value } МіБ/с
 rate-gib = { $value } ГіБ/с
 
 no-value = -
+
+device-cpu = Процесор
+device-memory = Памʼять
+device-disk = Диск
+device-network = Мережа
+
+last-seconds = останні { $count } секунд
+show-per-core = За логічними процесорами
+show-overall = Загалом
+
+summary-cpu = { $value }
+summary-memory = { $used } з { $total }
+summary-disk = читання { $read }, запис { $write }
+summary-network = прийом { $rx }, передача { $tx }
