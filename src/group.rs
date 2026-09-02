@@ -365,7 +365,7 @@ mod tests {
         }
         assert_eq!(
             seen.len(),
-            probe.len(),
+            probe.processes().count(),
             "the rows hold a different number of processes than the walk found"
         );
 

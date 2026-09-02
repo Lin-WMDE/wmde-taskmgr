@@ -6404,6 +6404,7 @@ dependencies = [
  "i18n-embed-fl",
  "libcosmic",
  "rust-embed",
+ "rustix 1.1.4",
  "tracing",
  "tracing-subscriber",
  "wmde-sysmon",

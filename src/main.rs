@@ -4,6 +4,7 @@ mod app;
 mod group;
 mod localize;
 mod probe;
+mod processes;
 mod windows;
 
 fn main() -> cosmic::iced::Result {

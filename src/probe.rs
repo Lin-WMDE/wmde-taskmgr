@@ -191,16 +191,6 @@ impl Probe {
         self.procs.get(&pid)
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.procs.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.procs.is_empty()
-    }
-
     fn update(&mut self, pid: u32, dt: f64, cpu_delta: u64) {
         if !read_into(&mut self.path, &mut self.buf_stat, pid, "stat") {
             return;
@@ -526,7 +516,7 @@ mod tests {
     fn walks_the_running_system() {
         let mut probe = Probe::new();
         probe.sample();
-        assert!(probe.len() > 1, "a running system has more than one process");
+        assert!(probe.processes().count() > 1, "a running system has more than one process");
 
         let me = std::process::id();
         let this = probe.get(me).expect("the test process is in the list");
