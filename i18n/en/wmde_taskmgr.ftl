@@ -19,10 +19,6 @@ section-system = System processes
 group-panel = Panel
 group-desktop-shell = Desktop shell
 
-process-count = { $count ->
-    [one] { $count } process
-   *[other] { $count } processes
-}
 
 end-task = End task
 kill-task = Force quit

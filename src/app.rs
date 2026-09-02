@@ -16,7 +16,7 @@ use crate::probe::Probe;
 use crate::performance::{self, Performance};
 use crate::processes::{Column, Kind, Row};
 use crate::users::{self, Names};
-use crate::windows::{self, Window};
+use crate::windows::{self, Event, Window};
 
 /// How often the list is rebuilt. The reference calls this speed "normal", and a release
 /// walk of 1604 processes costs 31 ms, so a second leaves the machine alone between ticks.
@@ -34,8 +34,9 @@ pub enum Page {
 pub enum Message {
     /// Time to walk `/proc` again.
     Tick,
-    /// The compositor's window list changed.
-    Windows(Vec<Window>),
+    /// Something arrived from the bus: a new window list, or a second launch asking this
+    /// copy to show itself.
+    Bus(Event),
     /// The row clicked, together with the generation of the model it was clicked in.
     ///
     /// An `Entity` is a slotmap key, and a fresh model hands out the very same keys in the
@@ -330,9 +331,14 @@ impl cosmic::Application for App {
                 self.rebuild_users();
                 self.performance.tick();
             }
-            Message::Windows(windows) => {
+            Message::Bus(Event::Windows(windows)) => {
                 self.windows = windows;
                 self.rebuild();
+            }
+            Message::Bus(Event::Present) => {
+                if let Some(id) = self.core.main_window_id() {
+                    return cosmic::iced::window::gain_focus(id);
+                }
             }
             Message::Select(generation, entity) => {
                 if generation != self.generation {
@@ -414,7 +420,7 @@ impl cosmic::Application for App {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             cosmic::iced::time::every(TICK).map(|_| Message::Tick),
-            Subscription::run(windows::subscription).map(Message::Windows),
+            Subscription::run(windows::subscription).map(Message::Bus),
         ])
     }
 }

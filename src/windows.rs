@@ -8,15 +8,42 @@
 //! Owning the bus name is not incidental. The compositor answers only a caller that owns
 //! `fun.wmde.TaskManager`, because a window title names the document, address or conversation
 //! that is open. The name is taken for the life of the connection, which the subscription
-//! holds open, and that also makes a second copy of this program refuse to start.
+//! holds open. A second launch finds it taken and hands over to this copy instead - see
+//! `crate::single`.
 
 use cosmic::iced::futures::{SinkExt, Stream, channel::mpsc};
 use cosmic::iced::stream;
 
-const OWN_NAME: &str = "fun.wmde.TaskManager";
+pub const OWN_NAME: &str = "fun.wmde.TaskManager";
+/// Where this program answers `Present`, so a second launch can raise this window instead of
+/// opening one of its own.
+pub const OWN_PATH: &str = "/fun/wmde/TaskManager";
 const COMP_NAME: &str = "fun.wmde.Comp";
 const COMP_PATH: &str = "/fun/wmde/Comp/Windows";
 const COMP_IFACE: &str = "fun.wmde.Comp.Windows";
+
+/// What the bus half reports to the application.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// The compositor's window list, as it stands.
+    Windows(Vec<Window>),
+    /// Another launch asked this copy to show itself.
+    Present,
+}
+
+/// Served on our own name so a second launch has something to call.
+struct Instance {
+    tx: tokio::sync::mpsc::Sender<()>,
+}
+
+#[zbus::interface(name = "fun.wmde.TaskManager")]
+impl Instance {
+    /// Bring the existing window forward. A full channel means a request is already on its
+    /// way to the window; a second one would add nothing.
+    async fn present(&self) {
+        let _ = self.tx.try_send(());
+    }
+}
 
 /// One open window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,11 +59,13 @@ pub struct Window {
 /// A compositor without the interface - an older build, or a session that is not WMDE - is
 /// not an error here. The list simply stays empty, and every process then stands as its own
 /// row instead of being folded under the application that owns its window.
-pub fn subscription() -> impl Stream<Item = Vec<Window>> {
-    stream::channel(4, |mut output: mpsc::Sender<Vec<Window>>| async move {
+pub fn subscription() -> impl Stream<Item = Event> {
+    stream::channel(4, |mut output: mpsc::Sender<Event>| async move {
+        let (present_tx, mut present_rx) = tokio::sync::mpsc::channel(1);
         // Bound to the whole stream: dropping the connection drops the name, and the
         // compositor would start refusing us.
         let connection = match zbus::connection::Builder::session()
+            .and_then(|builder| builder.serve_at(OWN_PATH, Instance { tx: present_tx }))
             .and_then(|builder| builder.name(OWN_NAME))
             .map(zbus::connection::Builder::build)
         {
@@ -65,13 +94,23 @@ pub fn subscription() -> impl Stream<Item = Vec<Window>> {
         };
 
         // Once before waiting: the compositor signals changes, not the state it starts in.
-        if output.send(list(&proxy).await).await.is_err() {
+        if output.send(Event::Windows(list(&proxy).await)).await.is_err() {
             return;
         }
 
         use cosmic::iced::futures::StreamExt as _;
-        while changed.next().await.is_some() {
-            if output.send(list(&proxy).await).await.is_err() {
+        loop {
+            let event = tokio::select! {
+                signal = changed.next() => match signal {
+                    Some(_) => Event::Windows(list(&proxy).await),
+                    None => return,
+                },
+                request = present_rx.recv() => match request {
+                    Some(()) => Event::Present,
+                    None => return,
+                },
+            };
+            if output.send(event).await.is_err() {
                 return;
             }
         }

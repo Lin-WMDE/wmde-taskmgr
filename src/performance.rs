@@ -20,7 +20,8 @@ const WINDOW: usize = 60;
 const GRID_CELL: f32 = 40.0;
 
 const PLOT_HEIGHT: f32 = 240.0;
-const TILE_HEIGHT: f32 = 76.0;
+/// A per-core tile never goes below this, however many cores there are.
+const TILE_MIN_HEIGHT: f32 = 90.0;
 const THUMB_WIDTH: f32 = 60.0;
 const THUMB_HEIGHT: f32 = 34.0;
 const RAIL_WIDTH: f32 = 220.0;
@@ -230,7 +231,7 @@ impl Performance {
             .push(widget::text::heading(self.device.title()));
 
         if self.device == Device::Cpu && self.per_core && !self.cores.is_empty() {
-            main = main.push(self.core_tiles(spacing.space_xxxs));
+            main = main.push(self.core_tiles(spacing.space_xxxs).apply(widget::container).height(Length::Fill));
         } else {
             main = main.push(self.plot(self.device.kind(), &self.history, 0, PLOT_HEIGHT));
         }
@@ -258,32 +259,41 @@ impl Performance {
             .into()
     }
 
-    /// One small plot per logical processor.
+    /// One plot per logical processor, filling the height the page has to give.
+    ///
+    /// Wrapped in `responsive` for the same reason a single plot is: the tiles are drawn by a
+    /// fixed-size widget, and how tall each one may be is only known once the page around it
+    /// has been laid out.
     fn core_tiles(&self, gap: u16) -> Element<'_, Message> {
         let lines = self.cores.len().div_ceil(TILE_COLUMNS);
-        let mut grid = widget::column::with_capacity(lines).spacing(gap);
-        for line in 0..lines {
-            let mut row = widget::row::with_capacity(TILE_COLUMNS).spacing(gap);
-            for slot in 0..TILE_COLUMNS {
-                let i = line * TILE_COLUMNS + slot;
-                row = match self.cores.get(i) {
-                    Some(set) => row.push(
-                        widget::container(self.plot(
-                            Kind::Cpu,
-                            set,
-                            1 + Device::ALL.len() + i,
-                            TILE_HEIGHT,
-                        ))
-                        .width(Length::FillPortion(1)),
-                    ),
-                    // The last line is padded rather than stretched, so a machine with six
-                    // cores does not draw two double-width tiles.
-                    None => row.push(widget::Space::new().width(Length::FillPortion(1))),
-                };
+        widget::responsive(move |size| {
+            let gaps = gap as f32 * lines.saturating_sub(1) as f32;
+            let tile = ((size.height - gaps) / lines as f32).max(TILE_MIN_HEIGHT);
+            let mut grid = widget::column::with_capacity(lines).spacing(gap);
+            for line in 0..lines {
+                let mut row = widget::row::with_capacity(TILE_COLUMNS).spacing(gap);
+                for slot in 0..TILE_COLUMNS {
+                    let i = line * TILE_COLUMNS + slot;
+                    row = match self.cores.get(i) {
+                        Some(set) => row.push(
+                            widget::container(self.plot(
+                                Kind::Cpu,
+                                set,
+                                1 + Device::ALL.len() + i,
+                                tile,
+                            ))
+                            .width(Length::FillPortion(1)),
+                        ),
+                        // The last line is padded rather than stretched, so a machine with
+                        // six cores does not draw two double-width tiles.
+                        None => row.push(widget::Space::new().width(Length::FillPortion(1))),
+                    };
+                }
+                grid = grid.push(row);
             }
-            grid = grid.push(row);
-        }
-        grid.into()
+            grid.into()
+        })
+        .into()
     }
 
     /// The line under a device's name: what it is doing right now.

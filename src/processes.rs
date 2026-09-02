@@ -52,12 +52,16 @@ impl std::fmt::Display for Column {
 }
 
 impl ItemCategory for Column {
+    /// Wide enough for the longest value each column actually prints, and no wider: what is
+    /// left over goes to the name, which is the column that runs out of room first.
     fn width(&self) -> Length {
         match self {
             Self::Name => Length::Fill,
-            Self::Cpu | Self::Threads | Self::Pid => Length::Fixed(80.0),
-            Self::Memory | Self::Data => Length::Fixed(110.0),
-            Self::Disk => Length::Fixed(120.0),
+            Self::Cpu => Length::Fixed(60.0),
+            Self::Memory | Self::Data => Length::Fixed(92.0),
+            Self::Disk => Length::Fixed(96.0),
+            Self::Threads => Length::Fixed(56.0),
+            Self::Pid => Length::Fixed(60.0),
         }
     }
 
@@ -146,9 +150,10 @@ impl Row {
     #[must_use]
     pub fn group(g: &Group, expanded: bool) -> Self {
         let expandable = g.pids.len() > 1;
-        let count = g.pids.len() as i64;
+        // "Panel (15)", not "Panel - 15 processes": the name column is what is left after
+        // six number columns, and the long form wrapped a group onto three lines.
         let name = if expandable {
-            format!("{} - {}", group_label(g), fl!("process-count", count = count))
+            format!("{} ({})", group_label(g), g.pids.len())
         } else {
             group_label(g)
         };
@@ -195,14 +200,13 @@ impl Row {
         threads: u32,
         disk: Option<[f64; 2]>,
     ) -> Self {
-        let count = pids.len() as i64;
         Self {
             kind: Kind::Group {
                 expanded: false,
                 expandable: false,
             },
             key: None,
-            name: format!("{name} - {}", fl!("process-count", count = count)),
+            name: format!("{name} ({})", pids.len()),
             icon_name: None,
             cpu: percent(cpu),
             memory: size(rss),

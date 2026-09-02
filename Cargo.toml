@@ -11,6 +11,8 @@ rustix = { version = "1.1", features = ["process"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zbus = { version = "5.15.0", default-features = false, features = ["tokio"] }
+# A runtime for the single-instance check, which runs before the toolkit starts one.
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
 
 # Interface text. Ukrainian and English only - the stack has no Russian locale, and the
 # build gate in build-packages.sh fails if an i18n/ru* directory appears.

@@ -19,11 +19,6 @@ section-system = Системні процеси
 group-panel = Панель
 group-desktop-shell = Оболонка стільниці
 
-process-count = { $count ->
-    [one] { $count } процес
-    [few] { $count } процеси
-   *[many] { $count } процесів
-}
 
 end-task = Зняти завдання
 kill-task = Завершити примусово
