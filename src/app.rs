@@ -491,9 +491,12 @@ mod tests {
                 .count()
         };
 
+        // Containment, and nothing about what the machine happens to be running: a build
+        // container has its own pid namespace and shows no kernel threads at all, so
+        // demanding that the last step be a strict one is a claim about the environment.
         assert!(count(Scope::Mine) > 0, "the test process is one of ours");
         assert!(count(Scope::Mine) <= count(Scope::Users));
-        assert!(count(Scope::Users) < count(Scope::All), "a live system has kernel threads");
+        assert!(count(Scope::Users) <= count(Scope::All));
     }
 
     /// Every scope has a label in the catalogue, and no two read the same.
