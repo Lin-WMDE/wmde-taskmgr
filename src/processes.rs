@@ -367,6 +367,22 @@ mod tests {
         assert_eq!(percent(0.25), "25.0%");
     }
 
+    /// PID is the one number column built smallest-first, the way the reference orders it.
+    /// The arrow that describes the order is derived from this in app.rs and got it backwards.
+    #[test]
+    fn pid_sorts_smallest_first_unlike_every_other_number() {
+        let a = Row::process(&Process::stub(10, 1, "a"));
+        let b = Row::process(&Process::stub(20, 1, "b"));
+        assert_eq!(compare(&a, &b, Column::Pid), std::cmp::Ordering::Less);
+
+        // Memory, for contrast: the bigger number comes first.
+        let mut big = Row::process(&Process::stub(30, 1, "c"));
+        let mut small = Row::process(&Process::stub(40, 1, "d"));
+        big.sort_memory = 100;
+        small.sort_memory = 1;
+        assert_eq!(compare(&big, &small, Column::Memory), std::cmp::Ordering::Less);
+    }
+
     #[test]
     fn sizes_climb_through_the_units() {
         assert!(size(512).ends_with("КіБ") || size(512).ends_with("KiB"));

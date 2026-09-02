@@ -79,7 +79,10 @@ pub enum Message {
     /// A tab in the title bar was picked.
     Tab(segmented_button::Entity),
     Sort(Column),
-    EndTask { force: bool },
+    /// End the process the menu was opened over. Never the selected one: a right click
+    /// dropped by the generation guard would otherwise leave the previous row armed, and the
+    /// signal would go somewhere the user never pointed.
+    EndTask { pid: u32, force: bool },
     DismissError,
     Performance(performance::Message),
 }
@@ -102,8 +105,11 @@ impl Selection {
         })
     }
 
-    fn matches(&self, row: &Row) -> bool {
+    /// The pid alone is not enough: a number is handed out again once the process holding it
+    /// exits, and the selection would then land on a stranger.
+    fn matches(&self, row: &Row, probe: &Probe) -> bool {
         row.pids.as_slice() == [self.pid]
+            && probe.get(self.pid).map_or(0, |p| p.starttime) == self.starttime
     }
 }
 
@@ -128,8 +134,6 @@ pub struct App {
     generation: u64,
     /// Which row is selected, by an identity that survives a rebuild.
     selection: Option<Selection>,
-    /// What "end task" would act on, refreshed from whichever row the selection matched.
-    selected: Vec<u32>,
     error: Option<String>,
     performance: Performance,
     /// Read once: an account added while the window is open is vanishingly rare, and
@@ -188,24 +192,26 @@ impl App {
         }
 
         // The arrow only draws the direction; the order above is already built.
+        // PID is the one number built smallest-first, like the reference; every other
+        // number column is built largest-first. The arrow follows the order, not the column.
         let ascending = match column {
-            Column::Name => !reversed,
+            Column::Name | Column::Pid => !reversed,
             _ => reversed,
         };
         model.set_sort(Some((column, ascending)));
 
         // Restored by pid and start time, not by position: the list is rebuilt from scratch
         // every second and re-sorted while it is.
-        self.selected.clear();
         if let Some(want) = self.selection {
             let again = model
                 .iter()
-                .find(|entity| model.item(*entity).is_some_and(|r| want.matches(r)));
+                .find(|entity| {
+                    model
+                        .item(*entity)
+                        .is_some_and(|r| want.matches(r, &self.probe))
+                });
             match again {
-                Some(entity) => {
-                    self.selected = model.item(entity).map(|r| r.pids.clone()).unwrap_or_default();
-                    model.activate(entity);
-                }
+                Some(entity) => model.activate(entity),
                 // The process is gone. Forget it rather than leave a selection naming a pid
                 // that something else may now hold.
                 None => self.selection = None,
@@ -271,12 +277,21 @@ impl App {
             .on_item_right_click(move |entity| Message::Select(generation, entity))
             .on_category_left_click(Message::Sort)
             .item_context(|row: &Row| {
+                let pid = *row.pids.first()?;
                 row.is_task().then(|| {
                     widget::menu::items(
                         &HashMap::new(),
                         vec![
-                            widget::menu::Item::Button(fl!("end-task"), None, Action::EndTask),
-                            widget::menu::Item::Button(fl!("kill-task"), None, Action::KillTask),
+                            widget::menu::Item::Button(
+                                fl!("end-task"),
+                                None,
+                                Action::EndTask(pid),
+                            ),
+                            widget::menu::Item::Button(
+                                fl!("kill-task"),
+                                None,
+                                Action::KillTask(pid),
+                            ),
                         ],
                     )
                 })
@@ -343,7 +358,6 @@ impl cosmic::Application for App {
             table: table::Model::new(Column::ALL.to_vec()),
             generation: 0,
             selection: None,
-            selected: Vec::new(),
             error: None,
             performance: Performance::new(),
             user_names: Names::load(),
@@ -357,6 +371,8 @@ impl cosmic::Application for App {
         app.rebuild();
         app.rebuild_users();
         app.performance.tick();
+        // Otherwise the first frame draws the static's zero default in every heading.
+        app.publish_totals();
 
         let title = app.set_window_title(fl!("app-title"), app.core.main_window_id().unwrap());
         (app, title)
@@ -384,7 +400,6 @@ impl cosmic::Application for App {
         match message {
             Message::Tick => {
                 self.probe.sample();
-                self.publish_totals();
                 self.rebuild();
                 self.rebuild_users();
                 self.performance.counts = (
@@ -406,12 +421,10 @@ impl cosmic::Application for App {
                     return Task::none();
                 }
                 self.table.activate(entity);
-                let (selection, pids) = match self.table.item(entity) {
-                    Some(row) => (Selection::of(row, &self.probe), row.pids.clone()),
-                    None => (None, Vec::new()),
-                };
-                self.selection = selection;
-                self.selected = pids;
+                self.selection = self
+                    .table
+                    .item(entity)
+                    .and_then(|row| Selection::of(row, &self.probe));
             }
             Message::Search(text) => {
                 self.search = text;
@@ -436,10 +449,8 @@ impl cosmic::Application for App {
                 };
                 self.rebuild();
             }
-            Message::EndTask { force } => {
-                if !self.selected.is_empty() {
-                    self.error = crate::processes::end(&self.selected, force).err();
-                }
+            Message::EndTask { pid, force } => {
+                self.error = crate::processes::end(&[pid], force).err();
             }
             Message::DismissError => self.error = None,
             Message::Performance(message) => {
@@ -482,18 +493,18 @@ impl cosmic::Application for App {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     /// `SIGTERM`: the application gets to close its windows and save.
-    EndTask,
+    EndTask(u32),
     /// `SIGKILL`: it does not.
-    KillTask,
+    KillTask(u32),
 }
 
 impl widget::menu::Action for Action {
     type Message = Message;
 
     fn message(&self) -> Self::Message {
-        match self {
-            Self::EndTask => Message::EndTask { force: false },
-            Self::KillTask => Message::EndTask { force: true },
+        match *self {
+            Self::EndTask(pid) => Message::EndTask { pid, force: false },
+            Self::KillTask(pid) => Message::EndTask { pid, force: true },
         }
     }
 }

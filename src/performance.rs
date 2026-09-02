@@ -359,9 +359,16 @@ impl Performance {
                 tile = room.max(1.0);
             }
 
-            let mut grid = widget::column::with_capacity(lines).spacing(gap);
+            // Fill on both, because the children are FillPortion: a Shrink row resolves them
+            // against their intrinsic width, and the first tile takes the row while the rest
+            // lay out at zero.
+            let mut grid = widget::column::with_capacity(lines)
+                .spacing(gap)
+                .width(Length::Fill);
             for line in 0..lines {
-                let mut row = widget::row::with_capacity(columns).spacing(gap);
+                let mut row = widget::row::with_capacity(columns)
+                    .spacing(gap)
+                    .width(Length::Fill);
                 for slot in 0..columns {
                     let i = line * columns + slot;
                     row = match self.cores.get(i) {
