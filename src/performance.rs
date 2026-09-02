@@ -22,13 +22,24 @@ const GRID_CELL: f32 = 40.0;
 
 const PLOT_HEIGHT: f32 = 240.0;
 /// A per-core tile never goes below this, however many cores there are.
-const TILE_MIN_HEIGHT: f32 = 90.0;
+const TILE_MIN_HEIGHT: f32 = 60.0;
+/// Height over width of a per-core tile, measured off `ref/taskman/cpu.png`: 187 by 223.
+///
+/// The tiles keep this shape instead of stretching to whatever height the page has left, so
+/// the grid ends where it ends and the numbers under it sit right below the last row.
+const TILE_ASPECT: f32 = 187.0 / 223.0;
 const THUMB_WIDTH: f32 = 60.0;
 const THUMB_HEIGHT: f32 = 34.0;
 const RAIL_WIDTH: f32 = 220.0;
 const FACTS_WIDTH: f32 = 190.0;
-/// Per-core plots to a line, as the reference lays them out.
-const TILE_COLUMNS: usize = 4;
+/// Columns for `n` per-core tiles: a square-ish grid, rows and columns both.
+///
+/// Four logical processors give two by two, which is exactly what the reference draws; nine
+/// give three by three, sixteen four by four. A single row is what this replaced, and it left
+/// the tiles too thin to read at any core count worth looking at.
+fn tile_columns(n: usize) -> usize {
+    (n as f64).sqrt().ceil() as usize
+}
 
 /// The devices the rail lists, in the reference's order.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -240,7 +251,7 @@ impl Performance {
             .push(widget::text::heading(self.device.title()));
 
         if self.device == Device::Cpu && self.per_core && !self.cores.is_empty() {
-            main = main.push(self.core_tiles(spacing.space_xxxs).apply(widget::container).height(Length::Fill));
+            main = main.push(self.core_tiles(spacing.space_xxxs));
         } else {
             main = main.push(self.plot(self.device.kind(), &self.history, 0, PLOT_HEIGHT));
         }
@@ -325,21 +336,34 @@ impl Performance {
         panel.into()
     }
 
-    /// One plot per logical processor, filling the height the page has to give.
+    /// One plot per logical processor, laid out in a grid.
     ///
     /// Wrapped in `responsive` for the same reason a single plot is: the tiles are drawn by a
-    /// fixed-size widget, and how tall each one may be is only known once the page around it
+    /// fixed-size widget, and how wide each one may be is only known once the page around it
     /// has been laid out.
     fn core_tiles(&self, gap: u16) -> Element<'_, Message> {
-        let lines = self.cores.len().div_ceil(TILE_COLUMNS);
+        let count = self.cores.len();
+        let columns = tile_columns(count).max(1);
+        let lines = count.div_ceil(columns);
+
         widget::responsive(move |size| {
-            let gaps = gap as f32 * lines.saturating_sub(1) as f32;
-            let tile = ((size.height - gaps) / lines as f32).max(TILE_MIN_HEIGHT);
+            let gaps = gap as f32 * (columns.saturating_sub(1)) as f32;
+            let width = ((size.width - gaps) / columns as f32).max(1.0);
+            let mut tile = (width * TILE_ASPECT).max(TILE_MIN_HEIGHT);
+
+            // The shape gives way before the page does: a machine with many cores would
+            // otherwise push the caption and the numbers off the bottom.
+            let rows_gaps = gap as f32 * (lines.saturating_sub(1)) as f32;
+            let room = (size.height - rows_gaps) / lines as f32;
+            if room > 1.0 && room < tile {
+                tile = room.max(1.0);
+            }
+
             let mut grid = widget::column::with_capacity(lines).spacing(gap);
             for line in 0..lines {
-                let mut row = widget::row::with_capacity(TILE_COLUMNS).spacing(gap);
-                for slot in 0..TILE_COLUMNS {
-                    let i = line * TILE_COLUMNS + slot;
+                let mut row = widget::row::with_capacity(columns).spacing(gap);
+                for slot in 0..columns {
+                    let i = line * columns + slot;
                     row = match self.cores.get(i) {
                         Some(set) => row.push(
                             widget::container(self.plot(
@@ -350,8 +374,8 @@ impl Performance {
                             ))
                             .width(Length::FillPortion(1)),
                         ),
-                        // The last line is padded rather than stretched, so a machine with
-                        // six cores does not draw two double-width tiles.
+                        // The last row is padded rather than stretched, so a machine with six
+                        // cores does not draw two double-width tiles.
                         None => row.push(widget::Space::new().width(Length::FillPortion(1))),
                     };
                 }
@@ -425,5 +449,34 @@ fn rate(per_second: f64) -> String {
         fl!("rate-kib", value = format!("{:.0}", per_second / 1024.0))
     } else {
         fl!("rate-b", value = format!("{per_second:.0}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference draws four logical processors two by two, and that is the whole point of
+    /// the rule: rows AND columns, not one long row.
+    #[test]
+    fn four_processors_make_a_two_by_two_grid() {
+        assert_eq!(tile_columns(4), 2);
+        assert_eq!(4_usize.div_ceil(tile_columns(4)), 2);
+    }
+
+    #[test]
+    fn the_grid_stays_square_ish() {
+        for (n, cols) in [(1, 1), (2, 2), (4, 2), (6, 3), (9, 3), (12, 4), (16, 4), (20, 5)] {
+            assert_eq!(tile_columns(n), cols, "{n} processors");
+            let rows = n.div_ceil(cols);
+            assert!(rows <= cols, "{n} processors give {rows} rows of {cols} columns");
+        }
+    }
+
+    /// A tile keeps the reference's shape rather than stretching: 187 by 223.
+    #[test]
+    fn a_tile_is_shaped_like_the_reference() {
+        let width = 223.0_f32;
+        assert!((width * TILE_ASPECT - 187.0).abs() < 0.5);
     }
 }
