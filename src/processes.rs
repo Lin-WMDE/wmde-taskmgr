@@ -154,7 +154,9 @@ impl Row {
         };
         Self {
             kind: Kind::Group {
-                expanded,
+                // A group that has shrunk to one process while it was unfolded has nothing
+                // left to unfold, and a child row under it would repeat the row itself.
+                expanded: expanded && expandable,
                 expandable,
             },
             key: Some(g.key.clone()),
@@ -402,6 +404,33 @@ mod tests {
         // print 100.4% and make the column look broken.
         assert_eq!(percent(1.004), "100.0%");
         assert_eq!(percent(0.25), "25.0%");
+    }
+
+    /// A group of one is never unfolded, whatever was remembered about it: the child row
+    /// would be the group row again.
+    #[test]
+    fn a_group_that_shrank_to_one_stops_being_unfolded() {
+        let one = Group {
+            key: Key::Process(7),
+            name: "one".into(),
+            app_id: None,
+            section: Section::Background,
+            pids: vec![7],
+            cpu: 0.0,
+            rss: 0,
+            data: 0,
+            swap: 0,
+            threads: 1,
+            disk: None,
+        };
+        let row = Row::group(&one, true);
+        assert_eq!(
+            row.kind,
+            Kind::Group {
+                expanded: false,
+                expandable: false
+            }
+        );
     }
 
     #[test]
