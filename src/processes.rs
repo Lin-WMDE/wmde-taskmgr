@@ -80,7 +80,9 @@ impl Column {
 impl std::fmt::Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(total) = self.total() {
-            return write!(f, "{}  {total}", self.title());
+            // Two lines, as the reference writes it: the name, and the machine-wide figure
+            // under it. Side by side the pair does not fit a column sized for its values.
+            return write!(f, "{}\n{total}", self.title());
         }
         f.write_str(&self.title())
     }
