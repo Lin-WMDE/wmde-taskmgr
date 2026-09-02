@@ -15,7 +15,7 @@ use crate::group::{self, Group, Section};
 use crate::probe::Probe;
 use crate::performance::{self, Performance};
 use crate::processes::{Column, Kind, Row};
-use crate::users::{self, Names};
+use crate::users::{self, Names, Range};
 use crate::windows::{self, Event, Window};
 
 /// How often the list is rebuilt. The reference calls this speed "normal", and a release
@@ -105,6 +105,8 @@ pub struct App {
     /// Read once: an account added while the window is open is vanishingly rare, and
     /// re-reading `/etc/passwd` every second is not the way to catch it.
     user_names: Names,
+    /// Where regular accounts begin, out of `/etc/login.defs`.
+    user_range: Range,
     users: table::SingleSelectModel<Row, Column>,
 }
 
@@ -188,7 +190,7 @@ impl App {
 
     fn rebuild_users(&mut self) {
         let mut model = table::Model::new(Column::ALL.to_vec());
-        for row in users::rows(&self.probe, &self.user_names) {
+        for row in users::rows(&self.probe, &self.user_names, self.user_range, self.uid) {
             let _ = model.insert(row);
         }
         model.set_sort(Some((Column::Data, false)));
@@ -288,6 +290,7 @@ impl cosmic::Application for App {
             error: None,
             performance: Performance::new(),
             user_names: Names::load(),
+            user_range: Range::load(),
             users: table::Model::new(Column::ALL.to_vec()),
         };
         // The first walk has nothing to take a delta against, so every rate reads zero until

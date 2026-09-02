@@ -259,6 +259,12 @@ impl Row {
         row
     }
 
+    /// What the name column shows.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.name
+    }
+
     /// A heading is not a task and cannot be ended.
     #[must_use]
     pub fn is_task(&self) -> bool {
