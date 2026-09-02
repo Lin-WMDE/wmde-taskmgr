@@ -243,6 +243,18 @@ impl Row {
         }
     }
 
+    /// A bare row for the ordering tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn stub_named(name: &str, pid: u32) -> Self {
+        let mut row = Self::section(Section::Background, 0);
+        row.kind = Kind::Child;
+        row.name = name.to_owned();
+        row.pids = vec![pid];
+        row.sort_pid = pid;
+        row
+    }
+
     /// A heading is not a task and cannot be ended.
     #[must_use]
     pub fn is_task(&self) -> bool {
@@ -299,6 +311,15 @@ impl ItemInterface<Column> for Row {
 /// Order two rows by one column, largest first for a number and alphabetically for a name.
 #[must_use]
 pub fn compare(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
+    // Ties fall through to the name and then the pid. Groups arrive from a HashMap, whose
+    // order changes between ticks, so without a total order two rows holding the same number
+    // - and a idle machine has many - swap places every second.
+    by(a, b, category)
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.sort_pid.cmp(&b.sort_pid))
+}
+
+fn by(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match category {
         Column::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -431,6 +452,23 @@ mod tests {
                 expandable: false
             }
         );
+    }
+
+    /// Two rows that tie on the sorted column must still have a fixed order, or the list
+    /// reshuffles itself every second on an idle machine where most numbers are equal.
+    #[test]
+    fn ties_are_broken_the_same_way_every_time() {
+        let mut a = Row::stub_named("alpha", 10);
+        let mut b = Row::stub_named("beta", 20);
+        a.sort_data = 0;
+        b.sort_data = 0;
+        assert_eq!(compare(&a, &b, Column::Data), std::cmp::Ordering::Less);
+        assert_eq!(compare(&b, &a, Column::Data), std::cmp::Ordering::Greater);
+
+        // Same name too: the pid is the last resort.
+        let mut c = Row::stub_named("alpha", 99);
+        c.sort_data = 0;
+        assert_eq!(compare(&a, &c, Column::Data), std::cmp::Ordering::Less);
     }
 
     #[test]

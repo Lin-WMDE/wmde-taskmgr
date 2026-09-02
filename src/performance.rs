@@ -155,6 +155,17 @@ impl Performance {
         }
     }
 
+    /// Throw away every cached drawing.
+    ///
+    /// A `canvas::Cache` is keyed by the bounds it was drawn at, and every large plot has the
+    /// same bounds - so a cache still holding the previous device's curve is handed back
+    /// verbatim for the new one.
+    pub fn invalidate(&self) {
+        for cache in &self.caches {
+            cache.clear();
+        }
+    }
+
     /// One plot, sized to whatever the layout gives it.
     ///
     /// Wrapped in `responsive` because [`Strip`] is a fixed-size widget: it has to be told a

@@ -36,13 +36,48 @@ pub enum Message {
     Tick,
     /// The compositor's window list changed.
     Windows(Vec<Window>),
-    Select(table::Entity),
-    /// Unfold or fold a group.
-    Toggle(table::Entity),
+    /// The row clicked, together with the generation of the model it was clicked in.
+    ///
+    /// An `Entity` is a slotmap key, and a fresh model hands out the very same keys in the
+    /// same order. A click delivered in the same batch as a tick would otherwise resolve
+    /// against the model built by that tick and name a different process - which, one press
+    /// of "End task" later, is the wrong process killed.
+    Select(u64, table::Entity),
+    /// Unfold or fold a group, in the generation it was clicked in.
+    Toggle(u64, table::Entity),
     Sort(Column),
     EndTask { force: bool },
     DismissError,
     Performance(performance::Message),
+}
+
+/// What a selection points at, in terms that outlive a rebuild of the model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Selection {
+    /// A group, by the key the grouping layer assigns it.
+    Group(group::Key),
+    /// One process inside an unfolded group. The start time tells a recycled pid apart from
+    /// the process that held it before.
+    Process(u32, u64),
+}
+
+impl Selection {
+    fn of(row: &Row, probe: &Probe) -> Option<Self> {
+        if let Some(key) = &row.key {
+            return Some(Self::Group(key.clone()));
+        }
+        let pid = *row.pids.first()?;
+        Some(Self::Process(pid, probe.get(pid).map_or(0, |p| p.starttime)))
+    }
+
+    fn matches(&self, row: &Row) -> bool {
+        match self {
+            Self::Group(key) => row.key.as_ref() == Some(key),
+            // A child row carries exactly one pid; the start time was checked when the
+            // selection was made and a mismatch simply drops the highlight next tick.
+            Self::Process(pid, _) => row.key.is_none() && row.pids.as_slice() == [*pid],
+        }
+    }
 }
 
 pub struct App {
@@ -58,8 +93,11 @@ pub struct App {
     /// column is actually read in.
     sort: (Column, bool),
     table: table::SingleSelectModel<Row, Column>,
-    /// What "end task" would act on. Kept apart from the table's own selection because the
-    /// table is rebuilt from scratch every tick.
+    /// Bumped by every rebuild. A message minted against an older model is dropped.
+    generation: u64,
+    /// Which row is selected, by an identity that survives a rebuild.
+    selection: Option<Selection>,
+    /// What "end task" would act on, refreshed from whichever row the selection matched.
     selected: Vec<u32>,
     error: Option<String>,
     performance: Performance,
@@ -82,6 +120,7 @@ impl App {
     /// Rebuilt rather than patched: a tick can add, remove and reorder rows at once, and the
     /// selection is carried over by pid, which survives all three.
     fn rebuild(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         let groups = group::build(&self.probe, &self.windows, self.uid);
         let (column, reversed) = self.sort;
         let mut model = table::Model::new(Column::ALL.to_vec());
@@ -123,12 +162,23 @@ impl App {
         };
         model.set_sort(Some((column, ascending)));
 
-        if !self.selected.is_empty() {
+        // Restored by identity, not by the pid list: a group's members come and go, and
+        // matching on the exact vector loses the highlight the moment a helper exits.
+        self.selected.clear();
+        if let Some(want) = &self.selection {
             let again = model
                 .iter()
-                .find(|entity| model.item(*entity).is_some_and(|r| r.pids == self.selected));
-            if let Some(entity) = again {
-                model.activate(entity);
+                .find(|entity| model.item(*entity).is_some_and(|r| want.matches(r)));
+            match again {
+                Some(entity) => {
+                    model.activate(entity);
+                    if let Some(row) = model.item(entity) {
+                        self.selected = row.pids.clone();
+                    }
+                }
+                // The row is gone. Forget it rather than leave a selection that names
+                // nothing and an "End task" button that would act on a stale pid.
+                None => self.selection = None,
             }
         }
 
@@ -144,17 +194,23 @@ impl App {
         self.users = model;
     }
 
+    /// The selected row.
+    ///
+    /// Read out of the item map. `active_data` reads the model's `storage` map, which only
+    /// `EntityMut::data()` ever fills, and the rows here are inserted without it - so that
+    /// call returned `None` for every row and left the header button dead.
     fn active_row(&self) -> Option<&Row> {
-        self.table.active_data::<Row>()
+        self.table.item(self.table.active())
     }
 
     fn processes_view(&self) -> Element<'_, Message> {
+        let generation = self.generation;
         let table = widget::table(&self.table)
-            .on_item_left_click(Message::Select)
+            .on_item_left_click(move |entity| Message::Select(generation, entity))
             // Right click selects too, so the menu below always acts on the row it was
             // opened over rather than on whatever was selected before.
-            .on_item_right_click(Message::Select)
-            .on_item_double_click(Message::Toggle)
+            .on_item_right_click(move |entity| Message::Select(generation, entity))
+            .on_item_double_click(move |entity| Message::Toggle(generation, entity))
             .on_category_left_click(Message::Sort)
             .item_context(|row: &Row| {
                 row.is_task().then(|| {
@@ -225,6 +281,8 @@ impl cosmic::Application for App {
             // Memory first: it is the column the list is opened for.
             sort: (Column::Data, false),
             table: table::Model::new(Column::ALL.to_vec()),
+            generation: 0,
+            selection: None,
             selected: Vec::new(),
             error: None,
             performance: Performance::new(),
@@ -276,15 +334,25 @@ impl cosmic::Application for App {
                 self.windows = windows;
                 self.rebuild();
             }
-            Message::Select(entity) => {
+            Message::Select(generation, entity) => {
+                if generation != self.generation {
+                    return Task::none();
+                }
                 self.table.activate(entity);
-                self.selected = self
-                    .table
-                    .item(entity)
-                    .map(|row| row.pids.clone())
-                    .unwrap_or_default();
+                let (selection, pids) = match self.table.item(entity) {
+                    Some(row) if row.is_task() => {
+                        (Selection::of(row, &self.probe), row.pids.clone())
+                    }
+                    // A section heading is not selectable: it has nothing to end.
+                    _ => (None, Vec::new()),
+                };
+                self.selection = selection;
+                self.selected = pids;
             }
-            Message::Toggle(entity) => {
+            Message::Toggle(generation, entity) => {
+                if generation != self.generation {
+                    return Task::none();
+                }
                 // Only a group of more than one has anything folded away.
                 let key = self.table.item(entity).and_then(|row| match row.kind {
                     Kind::Group {
@@ -315,12 +383,18 @@ impl cosmic::Application for App {
                 }
             }
             Message::DismissError => self.error = None,
-            Message::Performance(message) => match message {
-                performance::Message::Select(device) => self.performance.device = device,
-                performance::Message::TogglePerCore => {
-                    self.performance.per_core = !self.performance.per_core;
+            Message::Performance(message) => {
+                match message {
+                    performance::Message::Select(device) => self.performance.device = device,
+                    performance::Message::TogglePerCore => {
+                        self.performance.per_core = !self.performance.per_core;
+                    }
                 }
-            },
+                // The plots are cached by size, and every large plot is the same size, so
+                // without this the new device is drawn with the old device's geometry until
+                // the next tick a second later.
+                self.performance.invalidate();
+            }
         }
         Task::none()
     }
