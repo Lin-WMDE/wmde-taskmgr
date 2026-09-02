@@ -2,6 +2,12 @@
 
 //! Folding processes into the rows the list shows.
 //!
+//! Not wired to anything at the moment: the process list is flat while its shape is being
+//! settled. The module stays because what it knows is expensive to rediscover - above all the
+//! barrier on the compositor, without which grouping quietly swallows the whole desktop.
+#![allow(dead_code)]
+
+//!
 //! Chrome is a hundred and eighty processes, the panel is fifteen, and a row per process
 //! answers nothing. The order of resolution runs from fact to guess:
 //!

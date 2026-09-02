@@ -2,7 +2,7 @@
 
 //! The window: a navigation rail on the left, one page per tab on the right.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use cosmic::app::{Core, Settings, Task};
@@ -11,10 +11,9 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, nav_bar, table};
 
 use crate::fl;
-use crate::group::{self, Group, Section};
-use crate::probe::Probe;
 use crate::performance::{self, Performance};
-use crate::processes::{Column, Kind, Row};
+use crate::probe::Probe;
+use crate::processes::{Column, Row};
 use crate::users::{self, Names, Range};
 use crate::windows::{self, Event, Window};
 
@@ -44,8 +43,9 @@ pub enum Message {
     /// against the model built by that tick and name a different process - which, one press
     /// of "End task" later, is the wrong process killed.
     Select(u64, table::Entity),
-    /// Unfold or fold a group, in the generation it was clicked in.
-    Toggle(u64, table::Entity),
+    /// The search box changed.
+    Search(String),
+    SearchClear,
     Sort(Column),
     EndTask { force: bool },
     DismissError,
@@ -53,31 +53,25 @@ pub enum Message {
 }
 
 /// What a selection points at, in terms that outlive a rebuild of the model.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Selection {
-    /// A group, by the key the grouping layer assigns it.
-    Group(group::Key),
-    /// One process inside an unfolded group. The start time tells a recycled pid apart from
-    /// the process that held it before.
-    Process(u32, u64),
+///
+/// The start time tells a recycled pid apart from the process that held it before.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Selection {
+    pid: u32,
+    starttime: u64,
 }
 
 impl Selection {
     fn of(row: &Row, probe: &Probe) -> Option<Self> {
-        if let Some(key) = &row.key {
-            return Some(Self::Group(key.clone()));
-        }
         let pid = *row.pids.first()?;
-        Some(Self::Process(pid, probe.get(pid).map_or(0, |p| p.starttime)))
+        Some(Self {
+            pid,
+            starttime: probe.get(pid).map_or(0, |p| p.starttime),
+        })
     }
 
     fn matches(&self, row: &Row) -> bool {
-        match self {
-            Self::Group(key) => row.key.as_ref() == Some(key),
-            // A child row carries exactly one pid; the start time was checked when the
-            // selection was made and a mismatch simply drops the highlight next tick.
-            Self::Process(pid, _) => row.key.is_none() && row.pids.as_slice() == [*pid],
-        }
+        row.pids.as_slice() == [self.pid]
     }
 }
 
@@ -88,7 +82,8 @@ pub struct App {
     windows: Vec<Window>,
     /// The person at the machine. Everything else is a system process.
     uid: u32,
-    expanded: HashSet<group::Key>,
+    /// Quick search over the name, the command line and the pid.
+    search: String,
     /// The column the list is ordered by, and whether the natural order is reversed. Natural
     /// means largest first for a number and alphabetical for a name, which is the order each
     /// column is actually read in.
@@ -124,38 +119,31 @@ impl App {
     /// selection is carried over by pid, which survives all three.
     fn rebuild(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        let groups = group::build(&self.probe, &self.windows, self.uid);
         let (column, reversed) = self.sort;
+
+        let window_of: HashMap<u32, &crate::windows::Window> =
+            self.windows.iter().map(|w| (w.pid, w)).collect();
+        let needle = self.search.trim().to_lowercase();
+
+        let mut rows: Vec<Row> = self
+            .probe
+            .processes()
+            .filter(|p| {
+                needle.is_empty()
+                    || p.name.to_lowercase().contains(&needle)
+                    || p.cmdline.to_lowercase().contains(&needle)
+                    || p.pid.to_string().contains(&needle)
+            })
+            .map(|p| Row::process(p, window_of.get(&p.pid).copied()))
+            .collect();
+        rows.sort_by(|a, b| {
+            let order = crate::processes::compare(a, b, column);
+            if reversed { order.reverse() } else { order }
+        });
+
         let mut model = table::Model::new(Column::ALL.to_vec());
-
-        for section in [Section::Applications, Section::Background, Section::System] {
-            let in_section: Vec<&Group> =
-                groups.iter().filter(|g| g.section == section).collect();
-            if in_section.is_empty() {
-                continue;
-            }
-
-            let mut rows: Vec<(Row, &Group)> = in_section
-                .iter()
-                .map(|g| (Row::group(g, self.expanded.contains(&g.key)), *g))
-                .collect();
-            rows.sort_by(|a, b| {
-                let order = crate::processes::compare(&a.0, &b.0, column);
-                if reversed { order.reverse() } else { order }
-            });
-
-            let _ = model.insert(Row::section(section, in_section.len()));
-            for (row, g) in rows {
-                let expanded = matches!(row.kind, Kind::Group { expanded: true, .. });
-                let _ = model.insert(row);
-                if expanded {
-                    for pid in &g.pids {
-                        if let Some(p) = self.probe.get(*pid) {
-                            let _ = model.insert(Row::child(p));
-                        }
-                    }
-                }
-            }
+        for row in rows {
+            let _ = model.insert(row);
         }
 
         // The arrow only draws the direction; the order above is already built.
@@ -165,22 +153,20 @@ impl App {
         };
         model.set_sort(Some((column, ascending)));
 
-        // Restored by identity, not by the pid list: a group's members come and go, and
-        // matching on the exact vector loses the highlight the moment a helper exits.
+        // Restored by pid and start time, not by position: the list is rebuilt from scratch
+        // every second and re-sorted while it is.
         self.selected.clear();
-        if let Some(want) = &self.selection {
+        if let Some(want) = self.selection {
             let again = model
                 .iter()
                 .find(|entity| model.item(*entity).is_some_and(|r| want.matches(r)));
             match again {
                 Some(entity) => {
+                    self.selected = model.item(entity).map(|r| r.pids.clone()).unwrap_or_default();
                     model.activate(entity);
-                    if let Some(row) = model.item(entity) {
-                        self.selected = row.pids.clone();
-                    }
                 }
-                // The row is gone. Forget it rather than leave a selection that names
-                // nothing and an "End task" button that would act on a stale pid.
+                // The process is gone. Forget it rather than leave a selection naming a pid
+                // that something else may now hold.
                 None => self.selection = None,
             }
         }
@@ -188,6 +174,11 @@ impl App {
         self.table = model;
     }
 
+    /// The selected row.
+    ///
+    /// Read out of the item map. `active_data` reads the model's `storage` map, which only
+    /// `EntityMut::data()` ever fills, and the rows here are inserted without it - so that
+    /// call returned `None` for every row and left the header button dead.
     fn rebuild_users(&mut self) {
         let mut model = table::Model::new(Column::ALL.to_vec());
         for row in users::rows(&self.probe, &self.user_names, self.user_range, self.uid) {
@@ -197,23 +188,20 @@ impl App {
         self.users = model;
     }
 
-    /// The selected row.
-    ///
-    /// Read out of the item map. `active_data` reads the model's `storage` map, which only
-    /// `EntityMut::data()` ever fills, and the rows here are inserted without it - so that
-    /// call returned `None` for every row and left the header button dead.
-    fn active_row(&self) -> Option<&Row> {
-        self.table.item(self.table.active())
-    }
-
     fn processes_view(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
         let generation = self.generation;
+
+        let search = widget::text_input::search_input(fl!("search"), &self.search)
+            .width(Length::Fixed(260.0))
+            .on_input(Message::Search)
+            .on_clear(Message::SearchClear);
+
         let table = widget::table(&self.table)
             .on_item_left_click(move |entity| Message::Select(generation, entity))
             // Right click selects too, so the menu below always acts on the row it was
             // opened over rather than on whatever was selected before.
             .on_item_right_click(move |entity| Message::Select(generation, entity))
-            .on_item_double_click(move |entity| Message::Toggle(generation, entity))
             .on_category_left_click(Message::Sort)
             .item_context(|row: &Row| {
                 row.is_task().then(|| {
@@ -230,13 +218,14 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let mut column = widget::column::with_capacity(2).push(table);
+        let mut column = widget::column::with_capacity(3)
+            .spacing(spacing.space_xxs)
+            .push(search)
+            .push(table);
         if let Some(error) = &self.error {
-            column = column.push(
-                widget::warning(error.clone()).on_close(Message::DismissError),
-            );
+            column = column.push(widget::warning(error.clone()).on_close(Message::DismissError));
         }
-        column.into()
+        column.padding(spacing.space_xxs).into()
     }
 }
 
@@ -280,7 +269,7 @@ impl cosmic::Application for App {
             probe: Probe::new(),
             windows: Vec::new(),
             uid: rustix::process::getuid().as_raw(),
-            expanded: HashSet::new(),
+            search: String::new(),
             // Memory first: it is the column the list is opened for.
             sort: (Column::Data, false),
             table: table::Model::new(Column::ALL.to_vec()),
@@ -314,18 +303,6 @@ impl cosmic::Application for App {
         Task::none()
     }
 
-    fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        if self.page() != Page::Processes {
-            return Vec::new();
-        }
-        let armed = self.active_row().is_some_and(Row::is_task);
-        vec![
-            widget::button::standard(fl!("end-task"))
-                .on_press_maybe(armed.then_some(Message::EndTask { force: false }))
-                .into(),
-        ]
-    }
-
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::Tick => {
@@ -349,32 +326,19 @@ impl cosmic::Application for App {
                 }
                 self.table.activate(entity);
                 let (selection, pids) = match self.table.item(entity) {
-                    Some(row) if row.is_task() => {
-                        (Selection::of(row, &self.probe), row.pids.clone())
-                    }
-                    // A section heading is not selectable: it has nothing to end.
-                    _ => (None, Vec::new()),
+                    Some(row) => (Selection::of(row, &self.probe), row.pids.clone()),
+                    None => (None, Vec::new()),
                 };
                 self.selection = selection;
                 self.selected = pids;
             }
-            Message::Toggle(generation, entity) => {
-                if generation != self.generation {
-                    return Task::none();
-                }
-                // Only a group of more than one has anything folded away.
-                let key = self.table.item(entity).and_then(|row| match row.kind {
-                    Kind::Group {
-                        expandable: true, ..
-                    } => row.key.clone(),
-                    _ => None,
-                });
-                if let Some(key) = key {
-                    if !self.expanded.remove(&key) {
-                        self.expanded.insert(key);
-                    }
-                    self.rebuild();
-                }
+            Message::Search(text) => {
+                self.search = text;
+                self.rebuild();
+            }
+            Message::SearchClear => {
+                self.search.clear();
+                self.rebuild();
             }
             Message::Sort(column) => {
                 // The same column again turns the order around; a different one starts from

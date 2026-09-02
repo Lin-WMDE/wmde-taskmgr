@@ -48,3 +48,5 @@ summary-cpu = { $value }
 summary-memory = { $used } of { $total }
 summary-disk = read { $read }, write { $write }
 summary-network = in { $rx }, out { $tx }
+
+search = Search

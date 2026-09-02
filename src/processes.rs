@@ -9,8 +9,8 @@ use cosmic::widget::{Icon, icon};
 use cosmic::iced::{Length, alignment::Horizontal};
 
 use crate::fl;
-use crate::group::{Group, Key, Section};
 use crate::probe::Process;
+use crate::windows::Window;
 
 /// The columns, in the order the list shows them.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -76,15 +76,12 @@ impl ItemCategory for Column {
 }
 
 /// What a row stands for.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
-    /// A heading with nothing but a name. Carries no numbers of its own.
-    Section(Section),
-    /// An application or a named group. `expandable` is false for a group of one, which has
-    /// nothing to unfold.
-    Group { expanded: bool, expandable: bool },
-    /// One process inside an unfolded group.
-    Child,
+    /// One process in the list.
+    Process,
+    /// One account on the users page. Not a task: it cannot be ended as a unit.
+    Account,
 }
 
 /// One line of the list, with every cell already rendered.
@@ -94,8 +91,6 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub kind: Kind,
-    /// Which group the row unfolds. `None` for a heading and for a child row.
-    pub key: Option<Key>,
     /// Processes this row would end. Empty for a section heading.
     pub pids: Vec<u32>,
     /// The icon name for an application row.
@@ -119,77 +114,36 @@ pub struct Row {
 }
 
 impl Row {
+    /// One process.
+    ///
+    /// Named by `comm`, the way the reference's details view names a process. A process that
+    /// owns a window also carries that application's icon, which is the only thing the
+    /// compositor's window list is used for in a flat list.
     #[must_use]
-    pub fn section(section: Section, count: usize) -> Self {
-        let name = match section {
-            Section::Applications => fl!("section-applications"),
-            Section::Background => fl!("section-background"),
-            Section::System => fl!("section-system"),
-        };
+    pub fn process(p: &Process, window: Option<&Window>) -> Self {
         Self {
-            kind: Kind::Section(section),
-            key: None,
-            pids: Vec::new(),
-            icon_name: None,
-            name: format!("{name} ({count})"),
-            cpu: String::new(),
-            memory: String::new(),
-            data: String::new(),
-            disk: String::new(),
-            threads: String::new(),
-            pid: String::new(),
-            sort_cpu: 0.0,
-            sort_memory: 0,
-            sort_data: 0,
-            sort_disk: 0.0,
-            sort_threads: 0,
-            sort_pid: 0,
+            kind: Kind::Process,
+            pids: vec![p.pid],
+            icon_name: window
+                .map(|w| w.app_id.clone())
+                .filter(|id| !id.is_empty()),
+            name: p.name.to_string(),
+            cpu: percent(p.cpu),
+            memory: size(p.rss),
+            data: size(p.data),
+            disk: rate(p.disk),
+            threads: p.threads.to_string(),
+            pid: p.pid.to_string(),
+            sort_cpu: p.cpu,
+            sort_memory: p.rss,
+            sort_data: p.data,
+            sort_disk: p.disk.map_or(0.0, |d| d[0] + d[1]),
+            sort_threads: p.threads,
+            sort_pid: p.pid,
         }
     }
 
-    #[must_use]
-    pub fn group(g: &Group, expanded: bool) -> Self {
-        let expandable = g.pids.len() > 1;
-        // "Panel (15)", not "Panel - 15 processes": the name column is what is left after
-        // six number columns, and the long form wrapped a group onto three lines.
-        let name = if expandable {
-            format!("{} ({})", group_label(g), g.pids.len())
-        } else {
-            group_label(g)
-        };
-        Self {
-            kind: Kind::Group {
-                // A group that has shrunk to one process while it was unfolded has nothing
-                // left to unfold, and a child row under it would repeat the row itself.
-                expanded: expanded && expandable,
-                expandable,
-            },
-            key: Some(g.key.clone()),
-            pids: g.pids.clone(),
-            icon_name: g.app_id.clone(),
-            name,
-            cpu: percent(g.cpu),
-            memory: size(g.rss),
-            data: size(g.data),
-            disk: rate(g.disk),
-            threads: g.threads.to_string(),
-            // A group of one names its process; a group of many has no single pid to show.
-            pid: if expandable {
-                fl!("no-value")
-            } else {
-                g.pids.first().map_or_else(|| fl!("no-value"), u32::to_string)
-            },
-            sort_cpu: g.cpu,
-            sort_memory: g.rss,
-            sort_data: g.data,
-            sort_disk: g.disk.map_or(0.0, |d| d[0] + d[1]),
-            sort_threads: g.threads,
-            sort_pid: g.pids.first().copied().unwrap_or(0),
-        }
-    }
-
-    /// A row for one account on the users page. It is a group of processes like any other,
-    /// but keyed by nothing: the users page does not unfold.
+    /// One account on the users page.
     #[must_use]
     pub fn user(
         name: String,
@@ -201,11 +155,7 @@ impl Row {
         disk: Option<[f64; 2]>,
     ) -> Self {
         Self {
-            kind: Kind::Group {
-                expanded: false,
-                expandable: false,
-            },
-            key: None,
+            kind: Kind::Account,
             name: format!("{name} ({})", pids.len()),
             icon_name: None,
             cpu: percent(cpu),
@@ -224,51 +174,17 @@ impl Row {
         }
     }
 
-    #[must_use]
-    pub fn child(p: &Process) -> Self {
-        Self {
-            kind: Kind::Child,
-            key: None,
-            pids: vec![p.pid],
-            icon_name: None,
-            name: p.name.to_string(),
-            cpu: percent(p.cpu),
-            memory: size(p.rss),
-            data: size(p.data),
-            disk: rate(p.disk),
-            threads: p.threads.to_string(),
-            pid: p.pid.to_string(),
-            sort_cpu: p.cpu,
-            sort_memory: p.rss,
-            sort_data: p.data,
-            sort_disk: p.disk.map_or(0.0, |d| d[0] + d[1]),
-            sort_threads: p.threads,
-            sort_pid: p.pid,
-        }
-    }
-
-    /// A bare row for the ordering tests.
+    /// What the name column shows. Only the tests need to read it back.
     #[cfg(test)]
-    #[must_use]
-    pub fn stub_named(name: &str, pid: u32) -> Self {
-        let mut row = Self::section(Section::Background, 0);
-        row.kind = Kind::Child;
-        row.name = name.to_owned();
-        row.pids = vec![pid];
-        row.sort_pid = pid;
-        row
-    }
-
-    /// What the name column shows.
     #[must_use]
     pub fn label(&self) -> &str {
         &self.name
     }
 
-    /// A heading is not a task and cannot be ended.
+    /// An account is not a task and cannot be ended.
     #[must_use]
     pub fn is_task(&self) -> bool {
-        !matches!(self.kind, Kind::Section(_))
+        matches!(self.kind, Kind::Process)
     }
 }
 
@@ -277,26 +193,9 @@ impl ItemInterface<Column> for Row {
         if category != Column::Name {
             return None;
         }
-        match &self.kind {
-            // The chevron is the only thing saying a row unfolds, so it stands where the
-            // application icon would and points the way it will move.
-            Kind::Group {
-                expandable: true,
-                expanded,
-            } => Some(
-                icon::from_name(if *expanded {
-                    "pan-down-symbolic"
-                } else {
-                    "pan-end-symbolic"
-                })
-                .icon(),
-            ),
-            Kind::Group { .. } => self
-                .icon_name
-                .as_ref()
-                .map(|name| icon::from_name(name.as_str()).icon()),
-            _ => None,
-        }
+        self.icon_name
+            .as_ref()
+            .map(|name| icon::from_name(name.as_str()).icon())
     }
 
     fn get_text(&self, category: Column) -> Cow<'static, str> {
@@ -342,14 +241,6 @@ fn by(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
     }
 }
 
-/// A group's built-in rules carry a message id, an application carries its own name.
-fn group_label(g: &Group) -> String {
-    match g.name.as_str() {
-        "panel" => fl!("group-panel"),
-        "desktop-shell" => fl!("group-desktop-shell"),
-        other => other.to_owned(),
-    }
-}
 
 /// End a task: `SIGTERM` first, which lets an application close its windows and save.
 ///
@@ -435,50 +326,6 @@ mod tests {
         // print 100.4% and make the column look broken.
         assert_eq!(percent(1.004), "100.0%");
         assert_eq!(percent(0.25), "25.0%");
-    }
-
-    /// A group of one is never unfolded, whatever was remembered about it: the child row
-    /// would be the group row again.
-    #[test]
-    fn a_group_that_shrank_to_one_stops_being_unfolded() {
-        let one = Group {
-            key: Key::Process(7),
-            name: "one".into(),
-            app_id: None,
-            section: Section::Background,
-            pids: vec![7],
-            cpu: 0.0,
-            rss: 0,
-            data: 0,
-            swap: 0,
-            threads: 1,
-            disk: None,
-        };
-        let row = Row::group(&one, true);
-        assert_eq!(
-            row.kind,
-            Kind::Group {
-                expanded: false,
-                expandable: false
-            }
-        );
-    }
-
-    /// Two rows that tie on the sorted column must still have a fixed order, or the list
-    /// reshuffles itself every second on an idle machine where most numbers are equal.
-    #[test]
-    fn ties_are_broken_the_same_way_every_time() {
-        let mut a = Row::stub_named("alpha", 10);
-        let mut b = Row::stub_named("beta", 20);
-        a.sort_data = 0;
-        b.sort_data = 0;
-        assert_eq!(compare(&a, &b, Column::Data), std::cmp::Ordering::Less);
-        assert_eq!(compare(&b, &a, Column::Data), std::cmp::Ordering::Greater);
-
-        // Same name too: the pid is the last resort.
-        let mut c = Row::stub_named("alpha", 99);
-        c.sort_data = 0;
-        assert_eq!(compare(&a, &c, Column::Data), std::cmp::Ordering::Less);
     }
 
     #[test]

@@ -48,3 +48,5 @@ summary-cpu = { $value }
 summary-memory = { $used } з { $total }
 summary-disk = читання { $read }, запис { $write }
 summary-network = прийом { $rx }, передача { $tx }
+
+search = Пошук
