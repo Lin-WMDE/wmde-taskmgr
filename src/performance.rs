@@ -340,7 +340,11 @@ impl Performance {
                     .width(Length::Fill)
                     .padding(spacing.space_xxs)
                     .selected(self.device == device)
-                    .class(cosmic::theme::Button::ListItem([0.0; 4]))
+                    .class(if self.device == device {
+                        selected_row()
+                    } else {
+                        cosmic::theme::Button::ListItem([0.0; 4])
+                    })
                     .on_press(Message::Select(device)),
             );
         }
@@ -618,6 +622,34 @@ impl Performance {
             Device::Disk => fl!("summary-disk-write", value = rate(s.disk[1])),
             Device::Network => fl!("summary-net-tx", value = rate(s.net[1])),
         }
+    }
+}
+
+/// A selected rail row: the grey of a selected list item, and neutral text with it.
+///
+/// `Button::ListItem` tints text and icon with the accent when selected. That is forbidden by
+/// rule 3 of [.doc/lists](../../../.doc/lists/README.md), and neither reference does it - the
+/// selected row of the reference's rail is the same white as every other row. Every state maps
+/// to the one appearance, so hovering the current device does not flicker it back to the
+/// unselected look. Same shape as `sidebar::selected_style` in wmde-files, at radius 0 rather
+/// than 2: the file manager's rounding is one of the two exceptions the lists chapter records,
+/// and this is not a third.
+fn selected_row() -> cosmic::theme::Button {
+    fn appearance(theme: &cosmic::Theme) -> widget::button::Style {
+        let cosmic = theme.cosmic();
+        let mut style = widget::button::Style::new();
+        style.background =
+            Some(Color::from(cosmic.primary(theme.transparent).component.hover).into());
+        style.text_color = Some(Color::from(cosmic.on_bg_color()));
+        style.icon_color = Some(Color::from(cosmic.on_bg_color()));
+        style.border_radius = [0.0_f32; 4].into();
+        style
+    }
+    cosmic::theme::Button::Custom {
+        active: Box::new(|_focused, theme| appearance(theme)),
+        disabled: Box::new(appearance),
+        hovered: Box::new(|_focused, theme| appearance(theme)),
+        pressed: Box::new(|_focused, theme| appearance(theme)),
     }
 }
 
