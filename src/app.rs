@@ -354,9 +354,16 @@ impl cosmic::Application for App {
             tabs = tabs.insert(move |b| b.text(label).data(page));
         }
         let mut tabs = tabs.build();
-        let first = tabs.iter().next();
-        if let Some(first) = first {
-            tabs.activate(first);
+        // The window opens on the load page, not on the first tab. A task manager is opened
+        // to see how busy the machine is far more often than to hunt for one process, and the
+        // load page answers that without a click. The process list stays first in the strip:
+        // the reference orders it that way, and the order is not the choice being made here.
+        let opening = tabs
+            .iter()
+            .find(|entity| tabs.data::<Page>(*entity) == Some(&Page::Performance))
+            .or_else(|| tabs.iter().next());
+        if let Some(opening) = opening {
+            tabs.activate(opening);
         }
 
         let mut app = App {
