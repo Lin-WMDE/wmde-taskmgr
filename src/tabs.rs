@@ -60,7 +60,11 @@ pub fn style() -> style::SegmentedButton {
         Appearance {
             background: None,
             border: iced::Border::default(),
-            active_width: 4.0,
+            // Zero, like the terminal and Files. libcosmic paints this hint under EVERY tab
+            // and the button background over it afterwards, so the active tab hides its own
+            // and only the background-less inactive ones show it - a white line under exactly
+            // the tabs that are not active, which is the opposite of an active-tab underline.
+            active_width: 0.0,
             active,
             inactive: ItemStatusAppearance {
                 background: None,

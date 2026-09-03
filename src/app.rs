@@ -456,9 +456,7 @@ impl cosmic::Application for App {
             Message::Performance(message) => {
                 match message {
                     performance::Message::Select(device) => self.performance.device = device,
-                    performance::Message::TogglePerCore => {
-                        self.performance.per_core = !self.performance.per_core;
-                    }
+                    performance::Message::PerCore(on) => self.performance.per_core = on,
                 }
                 // The plots are cached by size, and every large plot is the same size, so
                 // without this the new device is drawn with the old device's geometry until

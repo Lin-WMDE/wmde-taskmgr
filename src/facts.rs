@@ -7,11 +7,20 @@
 //!
 //! Read once at start-up. A processor does not gain cores while the window is open, and the
 //! model name and the cache sizes cost a `/proc/cpuinfo` parse that has no business running
-//! every second. What does change - load, process and thread counts, uptime - is not here.
+//! every second. What does change - load, process and thread counts, uptime, the clock and
+//! the descriptor count - is not here; the last two live in [`Live`] at the bottom of this
+//! file, which reads two small files a tick and nothing else.
+//!
+//! Every source is world-readable, and a source that is missing means the row is not drawn.
+//! `base_frequency` is the ordinary case: `intel_pstate` publishes it only in active mode,
+//! and DMI, which knows it regardless, is `0400`.
 
-use std::fmt::Write as _;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
-/// What the machine is. Empty strings for anything the machine does not say.
+const CPU_DIR: &str = "/sys/devices/system/cpu";
+
+/// What the machine is. Empty strings and `None` for anything the machine does not say.
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     /// `model name` out of `/proc/cpuinfo`.
@@ -20,10 +29,22 @@ pub struct Facts {
     pub cpus: usize,
     /// Distinct `physical id` values, or 1 when the machine does not say.
     pub sockets: usize,
-    /// Level and size, largest last: `("L1d", "48 KiB")`.
-    pub caches: Vec<(String, String)>,
+    /// Level and total size over the whole machine, in bytes, smallest level first:
+    /// `("L1", 2228224)`. Data and instruction caches of a level are summed together, the
+    /// way both references print them.
+    pub caches: Vec<(String, u64)>,
     /// `Yes` when the kernel says it is running under a hypervisor.
     pub virtualized: bool,
+    /// What the processor can host, named the way the reference names it:
+    /// `KVM / Intel VT-x`. Empty when the flags carry neither `vmx` nor `svm`.
+    pub virtualization: String,
+    /// `intel_cpufreq`, `acpi-cpufreq`, ... Empty when the kernel has no cpufreq at all,
+    /// which is the usual state of a virtual machine.
+    pub cpufreq_driver: String,
+    /// `schedutil`, `powersave`, ...
+    pub cpufreq_governor: String,
+    /// Base clock in kHz, where the driver publishes it.
+    pub base_khz: Option<u64>,
 }
 
 impl Facts {
@@ -34,8 +55,9 @@ impl Facts {
             ..Self::default()
         };
 
+        let mut flags = String::new();
         if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
-            let mut sockets = std::collections::BTreeSet::new();
+            let mut sockets = BTreeSet::new();
             for line in info.lines() {
                 let Some((key, value)) = line.split_once(':') else {
                     continue;
@@ -49,8 +71,9 @@ impl Facts {
                     }
                     // The kernel lists `hypervisor` among the flags on a guest, which is how
                     // the reference's "Virtual machine: Yes" is answered without asking dmi.
-                    "flags" if !out.virtualized => {
+                    "flags" if flags.is_empty() => {
                         out.virtualized = value.split_whitespace().any(|f| f == "hypervisor");
+                        flags = value.to_owned();
                     }
                     _ => {}
                 }
@@ -60,46 +83,169 @@ impl Facts {
             }
         }
 
+        out.virtualization = virtualization(&flags);
         out.caches = caches();
+
+        let cpufreq = Path::new(CPU_DIR).join("cpu0/cpufreq");
+        out.cpufreq_driver = read_trimmed(&cpufreq.join("scaling_driver")).unwrap_or_default();
+        out.cpufreq_governor = read_trimmed(&cpufreq.join("scaling_governor")).unwrap_or_default();
+        out.base_khz = read_trimmed(&cpufreq.join("base_frequency")).and_then(|s| s.parse().ok());
+
         out
     }
 }
 
-/// Cache levels of the first processor, from `/sys`.
+/// What the processor can host, or an empty string when it can host nothing.
 ///
-/// Only cpu0: every processor of a socket reports the same geometry, and listing it once per
-/// core would fill the panel with the same four lines forty times.
-fn caches() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache") else {
-        return out;
+/// `vmx` and `svm` say the silicon has the extension; `/dev/kvm` says the kernel is offering
+/// it. The reference prints both halves, and so does this.
+fn virtualization(flags: &str) -> String {
+    let extension = flags.split_whitespace().find_map(|f| match f {
+        "vmx" => Some("Intel VT-x"),
+        "svm" => Some("AMD-V"),
+        _ => None,
+    });
+    match (Path::new("/dev/kvm").exists(), extension) {
+        (true, Some(name)) => format!("KVM / {name}"),
+        (false, Some(name)) => name.to_owned(),
+        (true, None) => "KVM".to_owned(),
+        (false, None) => String::new(),
+    }
+}
+
+/// Cache totals over the whole machine, by level.
+///
+/// One cache is shared by several processors and is therefore listed under each of them.
+/// `shared_cpu_list` names the set that shares it, so `(level, type, shared_cpu_list)` is the
+/// identity of a physical cache and is what the walk deduplicates on - without it a machine
+/// with 32 processors reports 32 times its real L1.
+///
+/// Data and instruction caches of a level are then summed into one row: both references print
+/// a single `L1`, and telling a reader that L1d is 896 KiB answers a question nobody asked of
+/// a task manager.
+fn caches() -> Vec<(String, u64)> {
+    let mut seen = BTreeSet::new();
+    let mut total: BTreeMap<u32, u64> = BTreeMap::new();
+
+    let Ok(cpus) = std::fs::read_dir(CPU_DIR) else {
+        return Vec::new();
     };
-    let mut entries: Vec<_> = dir.flatten().map(|e| e.path()).collect();
-    entries.sort();
-    for path in entries {
-        let read = |name: &str| {
-            std::fs::read_to_string(path.join(name))
-                .ok()
-                .map(|s| s.trim().to_owned())
-        };
-        let (Some(level), Some(size)) = (read("level"), read("size")) else {
+    for cpu in cpus.flatten() {
+        let Ok(indices) = std::fs::read_dir(cpu.path().join("cache")) else {
             continue;
         };
-        // `type` tells Data from Instruction apart, which is why a machine has both L1d and
-        // L1i and why the level alone would name two different caches the same.
-        let kind = read("type").unwrap_or_default();
-        let suffix = match kind.as_str() {
-            "Data" => "d",
-            "Instruction" => "i",
-            _ => "",
-        };
-        let mut label = String::new();
-        let _ = write!(label, "L{level}{suffix}");
-        if !out.iter().any(|(l, _): &(String, String)| *l == label) {
-            out.push((label, size));
+        for index in indices.flatten() {
+            let path = index.path();
+            let read = |name: &str| read_trimmed(&path.join(name));
+            let (Some(level), Some(size)) = (read("level"), read("size")) else {
+                continue;
+            };
+            let (Ok(level), Some(size)) = (level.parse::<u32>(), parse_size(&size)) else {
+                continue;
+            };
+            let kind = read("type").unwrap_or_default();
+            let shared = read("shared_cpu_list").unwrap_or_default();
+            if seen.insert((level, kind, shared)) {
+                *total.entry(level).or_default() += size;
+            }
         }
     }
-    out
+
+    total
+        .into_iter()
+        .map(|(level, size)| (format!("L{level}"), size))
+        .collect()
+}
+
+/// `32K`, `4096K`, `36864K` - the only shapes sysfs writes, but the unit is read rather than
+/// assumed, because a cache big enough for `M` is not far off.
+fn parse_size(text: &str) -> Option<u64> {
+    let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let value: u64 = digits.parse().ok()?;
+    let scale = match text[digits.len()..].trim() {
+        "" => 1,
+        "K" | "KiB" => 1024,
+        "M" | "MiB" => 1024 * 1024,
+        "G" | "GiB" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    Some(value * scale)
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The two figures of the panel that change while the window is open.
+///
+/// Kept apart from [`Facts`] because they are read every tick and everything in `Facts` is
+/// read once. The paths are collected at start-up so a tick is file reads and nothing else.
+pub struct Live {
+    /// One per logical processor. Empty when the machine has no cpufreq, which is the usual
+    /// state under a hypervisor - and then the speed row is simply not drawn.
+    freq: Vec<PathBuf>,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Live {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut freq = Vec::new();
+        if let Ok(cpus) = std::fs::read_dir(CPU_DIR) {
+            for cpu in cpus.flatten() {
+                // Only `cpuN`, never `cpufreq` or `cpuidle`, which sit in the same directory.
+                let name = cpu.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name.starts_with("cpu") || !name[3..].bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                let path = cpu.path().join("cpufreq/scaling_cur_freq");
+                if path.exists() {
+                    freq.push(path);
+                }
+            }
+        }
+        freq.sort();
+        Self { freq }
+    }
+
+    /// Current clock in kHz, averaged over the processors that answer.
+    ///
+    /// Averaged rather than taken from cpu0: on a machine that parks its cores, cpu0 alone
+    /// says 800 MHz while the machine is at four gigahertz on the cores doing the work.
+    #[must_use]
+    pub fn speed_khz(&self) -> Option<u64> {
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        for path in &self.freq {
+            if let Some(khz) = read_trimmed(path).and_then(|s| s.parse::<u64>().ok()) {
+                sum += khz;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| sum / count)
+    }
+
+    /// Open file descriptors, machine-wide - the reference's "Handles".
+    ///
+    /// Field one of `/proc/sys/fs/file-nr` is the allocated count; field two has been a
+    /// constant zero since the slab allocator took over, and field three is the ceiling.
+    #[must_use]
+    pub fn handles() -> Option<u64> {
+        std::fs::read_to_string("/proc/sys/fs/file-nr")
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +261,7 @@ mod tests {
         // architecture may say nothing - so neither is asserted, only that the read is safe.
         let _ = facts.model;
         let _ = facts.caches;
+        let _ = facts.virtualization;
     }
 
     #[test]
@@ -125,5 +272,57 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), before, "a cache level is listed twice");
+    }
+
+    /// The reason the walk deduplicates: an L3 shared by every processor would otherwise be
+    /// counted once per processor, and a 36 MiB cache would read as better than a gigabyte.
+    #[test]
+    fn a_shared_cache_is_counted_once() {
+        let facts = Facts::load();
+        for (level, size) in &facts.caches {
+            assert!(*size > 0, "{level} is empty");
+            assert!(
+                *size < 4 * 1024 * 1024 * 1024,
+                "{level} is {size} bytes - the shared instances were summed"
+            );
+        }
+    }
+
+    #[test]
+    fn sysfs_cache_sizes_carry_their_unit() {
+        assert_eq!(parse_size("32K"), Some(32 * 1024));
+        assert_eq!(parse_size("36864K"), Some(36864 * 1024));
+        assert_eq!(parse_size("12M"), Some(12 * 1024 * 1024));
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("what"), None);
+    }
+
+    /// Both halves are named, and the extension alone is enough when the module is not there.
+    #[test]
+    fn virtualization_names_what_it_finds() {
+        assert!(virtualization("fpu vme de vmx pse").contains("Intel VT-x"));
+        assert!(virtualization("fpu svm pse").contains("AMD-V"));
+        assert_eq!(virtualization("fpu vme de pse"), {
+            if Path::new("/dev/kvm").exists() {
+                "KVM".to_owned()
+            } else {
+                String::new()
+            }
+        });
+    }
+
+    /// Reading the live half must be safe wherever it runs, including a machine with no
+    /// cpufreq at all - the answer is then `None`, never a zero pretending to be a reading.
+    #[test]
+    fn the_live_half_answers_or_stays_silent() {
+        let live = Live::new();
+        match live.speed_khz() {
+            Some(khz) => assert!(khz > 0, "a processor that answers is running"),
+            None => assert!(live.freq.is_empty()),
+        }
+        if let Some(handles) = Live::handles() {
+            assert!(handles > 0, "a running system holds descriptors open");
+        }
     }
 }

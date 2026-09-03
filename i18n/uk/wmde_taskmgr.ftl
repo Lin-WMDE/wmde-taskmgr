@@ -44,10 +44,11 @@ last-seconds = останні { $count } секунд
 show-per-core = За логічними процесорами
 show-overall = Загалом
 
-summary-cpu = { $value }
 summary-memory = { $used } з { $total }
-summary-disk = читання { $read }, запис { $write }
-summary-network = прийом { $rx }, передача { $tx }
+summary-disk-read = читання { $value }
+summary-disk-write = запис { $value }
+summary-net-rx = прийом { $value }
+summary-net-tx = передача { $value }
 
 search = Пошук
 
@@ -56,11 +57,20 @@ scope-users = Усі користувацькі
 scope-all = Разом із ядерними
 
 fact-utilization = Завантаження
+fact-speed = Швидкість
 fact-processes = Процесів
 fact-threads = Потоків
+fact-handles = Дескрипторів
 fact-uptime = Час роботи
-fact-cpus = Логічних процесорів
-fact-sockets = Сокетів
-fact-virtual = Віртуальна машина
+fact-base-speed = Базова швидкість:
+fact-cpus = Логічних процесорів:
+fact-sockets = Сокетів:
+fact-virtualization = Віртуалізація:
+fact-virtual = Віртуальна машина:
+fact-cache = Кеш { $level }:
+fact-cpufreq-driver = Драйвер cpufreq:
+fact-cpufreq-governor = Регулятор cpufreq:
 fact-yes = Так
 fact-no = Ні
+
+speed-ghz = { $value } ГГц

@@ -44,10 +44,11 @@ last-seconds = last { $count } seconds
 show-per-core = Per logical processor
 show-overall = Overall
 
-summary-cpu = { $value }
 summary-memory = { $used } of { $total }
-summary-disk = read { $read }, write { $write }
-summary-network = in { $rx }, out { $tx }
+summary-disk-read = read { $value }
+summary-disk-write = write { $value }
+summary-net-rx = in { $value }
+summary-net-tx = out { $value }
 
 search = Search
 
@@ -56,11 +57,20 @@ scope-users = All users
 scope-all = Including kernel
 
 fact-utilization = Utilization
+fact-speed = Speed
 fact-processes = Processes
 fact-threads = Threads
+fact-handles = Handles
 fact-uptime = Up time
-fact-cpus = Logical processors
-fact-sockets = Sockets
-fact-virtual = Virtual machine
+fact-base-speed = Base speed:
+fact-cpus = Logical processors:
+fact-sockets = Sockets:
+fact-virtualization = Virtualization:
+fact-virtual = Virtual machine:
+fact-cache = { $level } cache:
+fact-cpufreq-driver = Cpufreq driver:
+fact-cpufreq-governor = Cpufreq governor:
 fact-yes = Yes
 fact-no = No
+
+speed-ghz = { $value } GHz
