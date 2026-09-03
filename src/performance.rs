@@ -144,8 +144,9 @@ fn rings() -> Rings {
 /// device instead, which is what both the reference and every task manager before it does.
 ///
 /// One `Colors` covers all four because the first band of each kind is a different band:
-/// `CpuUser`, `MemUsed`, `NetIn`, `DiskRead`. Under [`Style::Curve`] the first band is the
-/// only one drawn, so nothing else needs overriding.
+/// `CpuUser`, `MemUsed`, `NetIn`, `DiskRead`. Under [`Style::Curve`] the curve, its fill and
+/// its grid all take the colour of that first band whatever else is stacked under it, so
+/// nothing else needs overriding.
 fn device_colors() -> Colors {
     let theme = cosmic::theme::active();
     let palette = theme.cosmic();
