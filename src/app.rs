@@ -3,6 +3,7 @@
 //! The window: a navigation rail on the left, one page per tab on the right.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use cosmic::app::{Core, Settings, Task};
@@ -11,6 +12,9 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, segmented_button, table};
 
 use crate::fl;
+
+/// The search field, named so the tab switch can hand it the keyboard.
+static SEARCH: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("search"));
 use crate::performance::{self, Performance};
 use crate::probe::Probe;
 use crate::processes::{Column, Row};
@@ -254,6 +258,7 @@ impl App {
         let generation = self.generation;
 
         let search = widget::text_input::search_input(fl!("search"), &self.search)
+            .id(SEARCH.clone())
             .width(Length::Fill)
             .on_input(Message::Search)
             .on_clear(Message::SearchClear);
@@ -444,7 +449,15 @@ impl cosmic::Application for App {
                 self.search.clear();
                 self.rebuild();
             }
-            Message::Tab(entity) => self.tabs.activate(entity),
+            // Arriving at the process list puts the keyboard in the search field: the first
+            // thing anyone does on this page is look for a process, and the list itself takes
+            // no typing. Any other page leaves the focus where it was.
+            Message::Tab(entity) => {
+                self.tabs.activate(entity);
+                if self.page() == Page::Processes {
+                    return widget::text_input::focus(SEARCH.clone());
+                }
+            }
             Message::Scope(index) => {
                 self.scope = Scope::ALL.get(index).copied().unwrap_or_default();
                 self.rebuild();
