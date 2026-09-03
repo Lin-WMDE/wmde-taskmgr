@@ -17,6 +17,8 @@ use cosmic::widget;
 use wmde_sysmon::graph::{Colors, Kind, Metrics, Ring, Strip, Style};
 use wmde_sysmon::probe::{Probe, Sample, Sources};
 
+use crate::memory::Report;
+
 use crate::facts::{Facts, Live};
 use crate::fl;
 
@@ -178,6 +180,9 @@ pub struct Performance {
     pub per_core: bool,
     /// What the machine is, read once.
     facts: Facts,
+    /// What the memory modules are, read once. `None` on a machine whose firmware lists
+    /// none, and on one where the collector unit never ran.
+    modules: Option<Report>,
     /// The two figures of the facts panel that do not sit still.
     live: Live,
     speed_khz: Option<u64>,
@@ -208,6 +213,7 @@ impl Performance {
             // reads as idle on the aggregate.
             per_core: true,
             facts: Facts::load(),
+            modules: Report::load(),
             live: Live::new(),
             speed_khz: None,
             handles: None,
@@ -221,8 +227,11 @@ impl Performance {
             cpu: true,
             cpu_cores: self.per_core,
             memory: true,
+            // The memory page prints available, committed and the slab; the strip in the
+            // panel never does, which is why this is a flag and not always on.
+            memory_detail: true,
             network: true,
-            swap: false,
+            swap: true,
             load: false,
             disk: true,
         };
@@ -391,11 +400,14 @@ impl Performance {
             graph
         };
 
-        let main = widget::column::with_capacity(3)
+        let mut main = widget::column::with_capacity(4)
             .spacing(spacing.space_xxs)
             .push(heading)
             .push(labels)
             .push(graph);
+        if self.device == Device::Memory {
+            main = main.push(self.memory_panel());
+        }
 
         let mut row = widget::row::with_capacity(4)
             .push(widget::container(rail).width(Length::Fixed(RAIL_WIDTH)))
@@ -417,6 +429,129 @@ impl Performance {
             );
         }
         row.into()
+    }
+
+    /// Under the memory plot: what the memory is doing on the left, what the modules are on
+    /// the right, and one line per slot beneath them.
+    ///
+    /// The reference puts the same two blocks in the same place - `ref/taskman/memory\.png`.
+    /// The hardware half is drawn only when the collector left a report; a machine whose
+    /// firmware lists no memory devices, and every virtual machine, gets the left half alone.
+    fn memory_panel(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let s = &self.last;
+        let detail = s.mem_detail;
+
+        let pair = |label: String, value: String| {
+            widget::column::with_capacity(2)
+                .push(widget::text::caption(label).wrapping(Wrapping::None))
+                .push(widget::text::heading(value).wrapping(Wrapping::None))
+                .apply(Element::from)
+        };
+        let line = |label: String, value: String| {
+            widget::row::with_capacity(2)
+                .push(
+                    widget::text::caption(label)
+                        .wrapping(Wrapping::None)
+                        .width(Length::Fixed(FACT_KEY_WIDTH)),
+                )
+                .push(widget::text::caption(value).wrapping(Wrapping::None))
+        };
+
+        let mut figures = widget::column::with_capacity(3).spacing(spacing.space_xxs);
+        figures = figures.push(group(vec![
+            pair(fl!("fact-mem-in-use"), size(s.mem[0])),
+            pair(fl!("fact-mem-available"), size(detail.available)),
+        ]));
+        if detail.commit_limit > 0 {
+            figures = figures.push(group(vec![
+                pair(
+                    fl!("fact-mem-committed"),
+                    fl!(
+                        "fact-mem-committed-value",
+                        used = size(detail.committed),
+                        limit = size(detail.commit_limit)
+                    ),
+                ),
+                pair(fl!("fact-mem-cached"), size(s.mem[2])),
+            ]));
+        }
+        if s.swap_total > 0 {
+            figures = figures.push(group(vec![pair(
+                fl!("fact-mem-swap"),
+                fl!(
+                    "fact-mem-committed-value",
+                    used = size(s.swap_used),
+                    limit = size(s.swap_total)
+                ),
+            )]));
+        }
+
+        let mut row = widget::row::with_capacity(2)
+            .spacing(spacing.space_s)
+            .push(figures)
+            .push(widget::Space::new().width(Length::Fill));
+        let mut column = widget::column::with_capacity(3).spacing(spacing.space_s);
+
+        let Some(modules) = &self.modules else {
+            return column.push(row).into();
+        };
+
+        // The hardware column: every row left out when the firmware has nothing to put in it.
+        let mut hardware = widget::column::with_capacity(5).spacing(spacing.space_xxxs);
+        if let Some((now, max)) = modules.speed() {
+            hardware = hardware.push(line(
+                fl!("fact-mem-speed"),
+                match max {
+                    Some(max) => fl!("fact-mem-speed-rated", now = now, max = max),
+                    None => fl!("fact-mem-speed-value", value = now),
+                },
+            ));
+        }
+        hardware = hardware.push(line(
+            fl!("fact-mem-slots"),
+            fl!(
+                "fact-mem-slots-value",
+                used = modules.used(),
+                total = modules.slots()
+            ),
+        ));
+        if let Some(kind) = modules.kind() {
+            hardware = hardware.push(line(fl!("fact-mem-kind"), kind));
+        }
+        if let Some(form) = modules.form_factor() {
+            hardware = hardware.push(line(fl!("fact-mem-form-factor"), form));
+        }
+        if let Some(channels) = modules.channels() {
+            hardware = hardware.push(line(fl!("fact-mem-channels"), channels.to_string()));
+        }
+        row = row.push(widget::container(hardware).width(Length::Fixed(FACTS_WIDTH)));
+        column = column.push(row);
+
+        // One line per populated slot. Empty slots are counted above and not listed: a row
+        // that says only "DIMM_B2" carries nothing the slot count did not already say.
+        let mut list = widget::column::with_capacity(modules.slots() + 1)
+            .spacing(spacing.space_xxxs)
+            .push(widget::text::heading(fl!("fact-mem-modules")));
+        for module in modules.modules.iter().filter(|m| m.populated()) {
+            let mut what = size(module.size);
+            if !module.kind.is_empty() {
+                what.push(' ');
+                what.push_str(&module.kind);
+                if let Some(speed) = module.speed_now {
+                    what.push('-');
+                    what.push_str(&speed.to_string());
+                }
+            }
+            for extra in [&module.vendor, &module.part] {
+                if !extra.is_empty() {
+                    what.push_str(", ");
+                    what.push_str(extra);
+                }
+            }
+            list = list.push(line(module.locator.clone(), what));
+        }
+        column.push(list).into()
     }
 
     /// The last sample, for whoever needs the machine-wide figures.

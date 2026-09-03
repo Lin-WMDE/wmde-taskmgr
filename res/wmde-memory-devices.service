@@ -1,0 +1,45 @@
+[Unit]
+# Publishes the SMBIOS memory devices where an unprivileged desktop can read them.
+#
+# /sys/firmware/dmi/entries/17-*/raw is 0400 root and is the only source for the size, speed
+# and type of a module. This reads it once and leaves a world-readable report; the task
+# manager parses that and never needs a privilege of its own.
+Description=WMDE memory device report
+Documentation=https://wmde.fun
+ConditionPathExists=/sys/firmware/dmi/entries
+DefaultDependencies=no
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+# The report lives in /run and is written once; nothing has to re-read it, and the unit
+# stays "active" so `systemctl status` says the machine has one.
+RemainAfterExit=yes
+RuntimeDirectory=wmde
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/lib/wmde/wmde-memory-devices /run/wmde/memory-devices.ron
+
+# It reads two paths and writes one. Everything else is taken away: this runs as root only
+# because the kernel will not show SMBIOS to anyone else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

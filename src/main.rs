@@ -4,6 +4,7 @@ mod app;
 mod facts;
 mod group;
 mod localize;
+mod memory;
 mod performance;
 mod probe;
 mod processes;

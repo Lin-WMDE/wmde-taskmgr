@@ -24,6 +24,12 @@ rust-embed = "8.11.0"
 # by path across forks, the way wmde-term takes wmde-files.
 wmde-sysmon = { path = "../wmde-applets/wmde-sysmon" }
 
+# The memory module report, written by the wmde-memory-devices collector and read by the
+# window. RON because the rest of the stack speaks it; both crates are already in the graph
+# through cosmic-config, so this adds nothing to build.
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+
 [dependencies.libcosmic]
 path = "../libcosmic"
 default-features = false

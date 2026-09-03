@@ -8,6 +8,12 @@ cargo-target-dir := env('CARGO_TARGET_DIR', 'target')
 base-dir := absolute_path(clean(rootdir / prefix))
 bin-dst := base-dir / 'bin' / name
 data-dir := base-dir / 'share'
+lib-dir := base-dir / 'lib'
+# The SMBIOS collector: run by a unit as root, never by a person, so it goes under lib and
+# not on anyone's PATH.
+collector := 'wmde-memory-devices'
+collector-dst := lib-dir / 'wmde' / collector
+unit-dst := lib-dir / 'systemd' / 'system' / (collector + '.service')
 
 desktop-dst := data-dir / 'applications' / (appid + '.desktop')
 icons-src := 'res/icons/hicolor'
@@ -42,6 +48,8 @@ test *args:
 # Installs files
 install:
     install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{bin-dst}}
+    install -Dm0755 {{ cargo-target-dir / 'release' / collector }} {{collector-dst}}
+    install -Dm0644 res/{{collector}}.service {{unit-dst}}
     install -Dm0644 res/{{appid}}.desktop {{desktop-dst}}
     for size in `ls {{icons-src}}`; do \
         install -Dm0644 "{{icons-src}}/$size/apps/{{appid}}.svg" "{{icons-dst}}/$size/apps/{{appid}}.svg"; \

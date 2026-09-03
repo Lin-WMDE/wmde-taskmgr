@@ -73,4 +73,20 @@ fact-cpufreq-governor = Регулятор cpufreq:
 fact-yes = Так
 fact-no = Ні
 
+fact-mem-in-use = Зайнято
+fact-mem-available = Доступно
+fact-mem-committed = Виділено
+fact-mem-cached = Кешовано
+fact-mem-swap = Підкачка
+fact-mem-committed-value = { $used } / { $limit }
+fact-mem-speed = Швидкість:
+fact-mem-speed-value = { $value } МТ/с
+fact-mem-speed-rated = { $now } МТ/с (номінал { $max })
+fact-mem-slots = Слотів зайнято:
+fact-mem-slots-value = { $used } з { $total }
+fact-mem-kind = Тип:
+fact-mem-form-factor = Форм-фактор:
+fact-mem-channels = Каналів:
+fact-mem-modules = Модулі
+
 speed-ghz = { $value } ГГц

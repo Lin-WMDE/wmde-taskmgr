@@ -73,4 +73,23 @@ fact-cpufreq-governor = Cpufreq governor:
 fact-yes = Yes
 fact-no = No
 
+# Memory page, under the plot. The left half is what the memory is doing, the right half is
+# what the modules are - the second only appears when the collector left a report.
+fact-mem-in-use = In use
+fact-mem-available = Available
+fact-mem-committed = Committed
+fact-mem-cached = Cached
+fact-mem-swap = Swap
+fact-mem-committed-value = { $used } / { $limit }
+fact-mem-speed = Speed:
+fact-mem-speed-value = { $value } MT/s
+# The module runs slower than it is rated for, which is the part worth naming.
+fact-mem-speed-rated = { $now } MT/s (rated { $max })
+fact-mem-slots = Slots used:
+fact-mem-slots-value = { $used } of { $total }
+fact-mem-kind = Type:
+fact-mem-form-factor = Form factor:
+fact-mem-channels = Channels:
+fact-mem-modules = Modules
+
 speed-ghz = { $value } GHz

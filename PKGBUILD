@@ -48,7 +48,9 @@ check() {
 
 package() {
   cd "$srcdir/$pkgname"
-  # installs /usr/bin/wmde-taskmgr, the desktop entry and the hicolor icon
+  # installs /usr/bin/wmde-taskmgr, the desktop entry, the hicolor icon, and the SMBIOS
+  # collector with its unit. The unit ships disabled, the Arch way: without it the memory
+  # page shows what the memory is doing and nothing about the modules it is made of.
   just rootdir="$pkgdir" prefix=/usr install
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
