@@ -206,8 +206,15 @@ impl Probe {
             None => true,
         };
         if fresh {
-            let name = stat.comm.to_owned().into_boxed_str();
-            let cmdline = if read_into(&mut self.path, &mut self.buf_cmdline, pid, "cmdline") {
+            let has_cmdline = read_into(&mut self.path, &mut self.buf_cmdline, pid, "cmdline");
+            let name = has_cmdline
+                .then(|| full_name(stat.comm, &self.buf_cmdline))
+                .flatten()
+                .map_or_else(
+                    || stat.comm.to_owned().into_boxed_str(),
+                    |name| name.into_boxed_str(),
+                );
+            let cmdline = if has_cmdline {
                 parse_cmdline(&self.buf_cmdline)
             } else {
                 Box::default()
@@ -423,6 +430,25 @@ fn parse_io(raw: &[u8]) -> [u64; 2] {
 
 /// Arguments are separated by NUL and the line usually ends with one; a trailing empty
 /// argument would otherwise leave a space at the end of every command line.
+/// The whole name, when `comm` is a cut-down version of it.
+///
+/// The kernel caps `comm` at `TASK_COMM_LEN` - sixteen bytes with the terminator, fifteen
+/// characters of name - so anything longer arrives cut: `wmde-applet-bluetooth` shows up as
+/// `wmde-applet-blu`. `argv[0]` carries the whole thing and is already in the buffer, read
+/// for the command line, so this costs no syscall.
+///
+/// **The cut-down name has to be a prefix of the whole one**, and that is the entire test.
+/// It restores what the cap took and touches nothing else: a process that renamed itself
+/// through `prctl` has an `argv[0]` that no longer agrees, and a login shell writes `-bash`
+/// where `comm` says `bash`. Both keep `comm`, which is what they meant to be called.
+fn full_name(comm: &str, raw: &[u8]) -> Option<String> {
+    let argv0 = raw.split(|b| *b == 0).next()?;
+    let argv0 = std::str::from_utf8(argv0).ok()?;
+    // `argv[0]` is a path as often as it is a name, and the name is what a list shows.
+    let name = argv0.rsplit('/').next()?;
+    (name.len() > comm.len() && name.starts_with(comm)).then(|| name.to_owned())
+}
+
 fn parse_cmdline(raw: &[u8]) -> Box<str> {
     let trimmed = raw.strip_suffix(b"\0").unwrap_or(raw);
     let mut out = String::with_capacity(trimmed.len());
@@ -463,6 +489,34 @@ fn atou64(field: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_name_the_kernel_cut_is_put_back() {
+        // Fifteen characters is all `comm` holds, and every one of these arrived cut.
+        assert_eq!(
+            full_name("wmde-applet-blu", b"wmde-applet-bluetooth\0").as_deref(),
+            Some("wmde-applet-bluetooth")
+        );
+        assert_eq!(
+            full_name("wmde-files-appl", b"/usr/bin/wmde-files-applet\0--desktop\0").as_deref(),
+            Some("wmde-files-applet"),
+            "the path is not the name"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_cut_one_is_left_alone() {
+        // A login shell writes `-bash` where `comm` says `bash`: a different string, not a
+        // longer one, and `comm` is what the shell meant to be called.
+        assert_eq!(full_name("bash", b"-bash\0"), None);
+        // Renamed through prctl: `argv[0]` no longer describes it at all.
+        assert_eq!(full_name("gmain", b"/usr/bin/wmde-files\0"), None);
+        // Nothing longer to offer.
+        assert_eq!(full_name("wmde-comp", b"wmde-comp\0"), None);
+        assert_eq!(full_name("wmde-comp", b"/usr/bin/comp\0"), None);
+        // A kernel thread has an empty command line.
+        assert_eq!(full_name("kworker/0:1", b""), None);
+    }
 
     #[test]
     fn stat_splits_on_the_last_parenthesis() {
