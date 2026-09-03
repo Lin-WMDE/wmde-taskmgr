@@ -379,20 +379,39 @@ impl Performance {
         .into()
     }
 
+    /// A rail thumbnail, at the size the rail gives every one of them.
+    ///
+    /// Not `responsive` like the large plot, and that is not an optimization: a `responsive`
+    /// inside a `scrollable` is laid out against an unbounded height, hands back a size the
+    /// widget cannot use, and the mismatch takes the whole window's mouse handling with it -
+    /// the rail highlights under the pointer and nothing anywhere answers a click. The
+    /// thumbnail is eighty by fifty-four whatever the window does, so there is nothing to
+    /// measure.
+    fn thumb<'a>(&'a self, kind: Kind, history: &'a Rings, cache: usize) -> Element<'a, Message> {
+        Strip::new(
+            &Kind::ALL[kind.index()..=kind.index()],
+            history,
+            &self.colors,
+            &self.caches[cache.min(self.caches.len() - 1)],
+            Metrics {
+                horizontal: true,
+                length: THUMB_WIDTH,
+                thickness: THUMB_HEIGHT,
+                gap: 0.0,
+            },
+        )
+        // No grid in a thumbnail: the reference draws none, and six by ten inside eighty by
+        // fifty-four pixels would be a hatch rather than a grid.
+        .style(Style::Curve { cols: 1, rows: 1 })
+        .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
         let mut rail = widget::column::with_capacity(self.devices.len()).spacing(RAIL_GAP);
         for (i, device) in self.devices.iter().copied().enumerate() {
-            // No grid in a thumbnail: the reference draws none, and six by ten inside eighty
-            // by fifty-four pixels would be a hatch rather than a grid.
-            let thumb = self.plot(
-                device.kind(),
-                self.rings_of(device),
-                1 + i,
-                THUMB_HEIGHT,
-                Style::Curve { cols: 1, rows: 1 },
-            );
+            let thumb = self.thumb(device.kind(), self.rings_of(device), 1 + i);
             let entry = widget::row::with_capacity(2)
                 .spacing(spacing.space_xs)
                 .align_y(Alignment::Center)
