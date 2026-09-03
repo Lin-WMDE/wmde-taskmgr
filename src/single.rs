@@ -28,7 +28,10 @@ pub enum Start {
 pub fn claim_or_hand_over() -> Start {
     // A runtime of our own, for the moment before the toolkit starts one: zbus with the
     // tokio feature needs one, and there is none yet.
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
         return Start::Fresh;
     };
 

@@ -37,18 +37,26 @@ no-value = -
 
 device-cpu = CPU
 device-memory = Memory
-device-disk = Disk
-device-network = Network
+device-net-ethernet = Ethernet
+device-net-wireless = Wi-Fi
+device-disk-nvme = NVMe
+device-disk-ssd = SSD
+device-disk-hdd = HDD
+device-disk-removable = Removable
+# What a device is, and under which name the kernel knows it.
+device-node = { $what } ({ $node })
+device-disk-node = { $node }, { $size }
+link-mbit = { $value } Mbit/s
+link-gbit = { $value } Gbit/s
 
 last-seconds = last { $count } seconds
 show-per-core = Per logical processor
 show-overall = Overall
 
 summary-memory = { $used } of { $total }
-summary-disk-read = read { $value }
-summary-disk-write = write { $value }
-summary-net-rx = in { $value }
-summary-net-tx = out { $value }
+# Both rates on one line, the way the reference writes "S: 0 R: 0 Kbps".
+summary-disk-rate = R: { $read }  W: { $write }
+summary-net-rate = In: { $rx }  Out: { $tx }
 
 search = Search
 

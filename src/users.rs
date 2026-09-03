@@ -168,7 +168,10 @@ mod tests {
         let names = Names::load();
         let me = rustix::process::getuid().as_raw();
         let rows = rows(&probe, &names, Range::load(), me);
-        assert!(!rows.is_empty(), "a running system has at least one account");
+        assert!(
+            !rows.is_empty(),
+            "a running system has at least one account"
+        );
         let total: u64 = rows.iter().map(|r| r.sort_data).sum();
         assert!(total > 0, "the accounts hold some memory between them");
     }
@@ -190,7 +193,10 @@ mod tests {
 
     #[test]
     fn the_boundary_comes_from_login_defs() {
-        let range = Range { min: 1000, max: 60000 };
+        let range = Range {
+            min: 1000,
+            max: 60000,
+        };
         assert!(!range.holds(0), "root");
         assert!(!range.holds(999), "a system account");
         assert!(range.holds(1000), "the first regular account");

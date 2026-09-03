@@ -94,7 +94,11 @@ pub fn subscription() -> impl Stream<Item = Event> {
         };
 
         // Once before waiting: the compositor signals changes, not the state it starts in.
-        if output.send(Event::Windows(list(&proxy).await)).await.is_err() {
+        if output
+            .send(Event::Windows(list(&proxy).await))
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -118,7 +122,10 @@ pub fn subscription() -> impl Stream<Item = Event> {
 }
 
 async fn list(proxy: &zbus::Proxy<'_>) -> Vec<Window> {
-    match proxy.call::<_, _, Vec<(u32, String, String, bool)>>("List", &()).await {
+    match proxy
+        .call::<_, _, Vec<(u32, String, String, bool)>>("List", &())
+        .await
+    {
         Ok(rows) => rows
             .into_iter()
             .map(|(pid, app_id, title, activated)| Window {

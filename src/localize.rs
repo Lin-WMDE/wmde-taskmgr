@@ -38,6 +38,9 @@ pub fn localize() {
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
 
     if let Err(error) = localizer.select(&requested_languages) {
-        tracing::error!("Error while loading language for WMDE Task Manager {}", error);
+        tracing::error!(
+            "Error while loading language for WMDE Task Manager {}",
+            error
+        );
     }
 }

@@ -62,7 +62,12 @@ const COMM_LEN: usize = 15;
 const RULES: &[(&str, &[&str])] = &[
     (
         "panel",
-        &["wmde-panel", "wmde-applets", "wmde-applet-", "wmde-start-menu"],
+        &[
+            "wmde-panel",
+            "wmde-applets",
+            "wmde-applet-",
+            "wmde-start-menu",
+        ],
     ),
     (
         "desktop-shell",
@@ -203,7 +208,11 @@ pub fn build(probe: &Probe, windows: &[Window], uid: u32) -> Vec<Group> {
 
 /// Walk up to the first ancestor that resolved to something, stopping at pid 1 and at a
 /// barrier.
-fn inherit(p: &Process, by_pid: &HashMap<u32, &Process>, direct: &HashMap<u32, Key>) -> Option<Key> {
+fn inherit(
+    p: &Process,
+    by_pid: &HashMap<u32, &Process>,
+    direct: &HashMap<u32, Key>,
+) -> Option<Key> {
     let mut seen = vec![p.pid];
     let mut cur = by_pid.get(&p.ppid).copied();
     while let Some(c) = cur {
@@ -272,7 +281,11 @@ fn section_of(
             .get(pid)
             .is_none_or(|p| p.uid != uid || p.is_kernel_thread())
     });
-    if all_system { Section::System } else { Section::Background }
+    if all_system {
+        Section::System
+    } else {
+        Section::Background
+    }
 }
 
 #[cfg(test)]
@@ -348,11 +361,24 @@ mod tests {
     /// full has to keep matching them.
     #[test]
     fn rules_survive_the_comm_truncation() {
-        assert_eq!(rule_for(&proc(1, 1, "wmde-notificati")), Some("desktop-shell"));
-        assert_eq!(rule_for(&proc(1, 1, "wmde-settings-d")), Some("desktop-shell"));
-        assert_eq!(rule_for(&proc(1, 1, "xdg-desktop-por")), Some("desktop-shell"));
+        assert_eq!(
+            rule_for(&proc(1, 1, "wmde-notificati")),
+            Some("desktop-shell")
+        );
+        assert_eq!(
+            rule_for(&proc(1, 1, "wmde-settings-d")),
+            Some("desktop-shell")
+        );
+        assert_eq!(
+            rule_for(&proc(1, 1, "xdg-desktop-por")),
+            Some("desktop-shell")
+        );
         // And the truncation must not turn a rule into a prefix that catches strangers.
-        assert_eq!(rule_for(&proc(1, 1, "wmde-settings")), None, "the settings window");
+        assert_eq!(
+            rule_for(&proc(1, 1, "wmde-settings")),
+            None,
+            "the settings window"
+        );
     }
 
     /// Every process lands in exactly one row. A process counted twice would inflate the

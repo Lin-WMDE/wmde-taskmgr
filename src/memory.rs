@@ -77,7 +77,9 @@ fn channel_of(text: &str) -> Option<char> {
     let lower = text.to_ascii_lowercase();
     if let Some(at) = lower.find("channel") {
         let rest = &text[at + "channel".len()..];
-        let c = rest.chars().find(|c| !c.is_whitespace() && *c != '-' && *c != '_')?;
+        let c = rest
+            .chars()
+            .find(|c| !c.is_whitespace() && *c != '-' && *c != '_')?;
         if c.is_ascii_alphanumeric() {
             return Some(c.to_ascii_uppercase());
         }
@@ -211,7 +213,11 @@ mod tests {
         assert_eq!(report.slots(), 4);
         assert_eq!(report.used(), 2);
         assert_eq!(report.total(), 32 << 30);
-        assert_eq!(report.channels(), Some(2), "two populated slots, two channels");
+        assert_eq!(
+            report.channels(),
+            Some(2),
+            "two populated slots, two channels"
+        );
     }
 
     #[test]

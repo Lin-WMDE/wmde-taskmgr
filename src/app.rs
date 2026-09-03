@@ -86,7 +86,10 @@ pub enum Message {
     /// End the process the menu was opened over. Never the selected one: a right click
     /// dropped by the generation guard would otherwise leave the previous row armed, and the
     /// signal would go somewhere the user never pointed.
-    EndTask { pid: u32, force: bool },
+    EndTask {
+        pid: u32,
+        force: bool,
+    },
     DismissError,
     Performance(performance::Message),
 }
@@ -207,13 +210,11 @@ impl App {
         // Restored by pid and start time, not by position: the list is rebuilt from scratch
         // every second and re-sorted while it is.
         if let Some(want) = self.selection {
-            let again = model
-                .iter()
-                .find(|entity| {
-                    model
-                        .item(*entity)
-                        .is_some_and(|r| want.matches(r, &self.probe))
-                });
+            let again = model.iter().find(|entity| {
+                model
+                    .item(*entity)
+                    .is_some_and(|r| want.matches(r, &self.probe))
+            });
             match again {
                 Some(entity) => model.activate(entity),
                 // The process is gone. Forget it rather than leave a selection naming a pid
@@ -292,11 +293,7 @@ impl App {
                     widget::menu::items(
                         &HashMap::new(),
                         vec![
-                            widget::menu::Item::Button(
-                                fl!("end-task"),
-                                None,
-                                Action::EndTask(pid),
-                            ),
+                            widget::menu::Item::Button(fl!("end-task"), None, Action::EndTask(pid)),
                             widget::menu::Item::Button(
                                 fl!("kill-task"),
                                 None,

@@ -132,7 +132,9 @@ fn parse(raw: &[u8]) -> Option<Module> {
         vendor: text(0x17),
         part: text(0x1A),
         // Bits 3:0, and zero there means the firmware does not know.
-        ranks: byte(raw, length, 0x1B).map(|a| a & 0x0F).filter(|r| *r != 0),
+        ranks: byte(raw, length, 0x1B)
+            .map(|a| a & 0x0F)
+            .filter(|r| *r != 0),
         volts: word(raw, length, 0x26).filter(|v| *v != 0).map(u32::from),
     })
 }
@@ -165,12 +167,14 @@ fn size(raw: &[u8], length: usize) -> Option<u64> {
         // Extended Size arrived with SMBIOS 2.7 and is megabytes in the low 31 bits.
         let low = word(raw, length, 0x1C)?;
         let high = word(raw, length, 0x1E)?;
-        let megabytes = u64::from(u32::from_le_bytes([
-            low.to_le_bytes()[0],
-            low.to_le_bytes()[1],
-            high.to_le_bytes()[0],
-            high.to_le_bytes()[1],
-        ]) & 0x7FFF_FFFF);
+        let megabytes = u64::from(
+            u32::from_le_bytes([
+                low.to_le_bytes()[0],
+                low.to_le_bytes()[1],
+                high.to_le_bytes()[0],
+                high.to_le_bytes()[1],
+            ]) & 0x7FFF_FFFF,
+        );
         return Some(megabytes << 20);
     }
     // Bit 15 clear - megabytes; set - kilobytes.

@@ -4,9 +4,9 @@
 
 use std::borrow::Cow;
 
+use cosmic::iced::{Length, alignment::Horizontal};
 use cosmic::widget::Icon;
 use cosmic::widget::table::{ItemCategory, ItemInterface};
-use cosmic::iced::{Length, alignment::Horizontal};
 
 use crate::fl;
 use crate::probe::Process;
@@ -271,15 +271,20 @@ fn by(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match category {
         Column::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        Column::Cpu => b.sort_cpu.partial_cmp(&a.sort_cpu).unwrap_or(Ordering::Equal),
+        Column::Cpu => b
+            .sort_cpu
+            .partial_cmp(&a.sort_cpu)
+            .unwrap_or(Ordering::Equal),
         Column::Memory => b.sort_memory.cmp(&a.sort_memory),
         Column::Data => b.sort_data.cmp(&a.sort_data),
-        Column::Disk => b.sort_disk.partial_cmp(&a.sort_disk).unwrap_or(Ordering::Equal),
+        Column::Disk => b
+            .sort_disk
+            .partial_cmp(&a.sort_disk)
+            .unwrap_or(Ordering::Equal),
         Column::Threads => b.sort_threads.cmp(&a.sort_threads),
         Column::Pid => a.sort_pid.cmp(&b.sort_pid),
     }
 }
-
 
 /// End a task: `SIGTERM` first, which lets an application close its windows and save.
 ///
@@ -315,7 +320,10 @@ fn percent(share: f32) -> String {
 fn size(kib: u64) -> String {
     let value = kib as f64;
     if value >= 1024.0 * 1024.0 {
-        fl!("size-gib", value = format!("{:.1}", value / (1024.0 * 1024.0)))
+        fl!(
+            "size-gib",
+            value = format!("{:.1}", value / (1024.0 * 1024.0))
+        )
     } else if value >= 1024.0 {
         fl!("size-mib", value = format!("{:.1}", value / 1024.0))
     } else {
@@ -331,9 +339,15 @@ fn rate(disk: Option<[f64; 2]>) -> String {
     };
     let value = read + written;
     if value >= 1024.0 * 1024.0 * 1024.0 {
-        fl!("rate-gib", value = format!("{:.1}", value / (1024.0 * 1024.0 * 1024.0)))
+        fl!(
+            "rate-gib",
+            value = format!("{:.1}", value / (1024.0 * 1024.0 * 1024.0))
+        )
     } else if value >= 1024.0 * 1024.0 {
-        fl!("rate-mib", value = format!("{:.1}", value / (1024.0 * 1024.0)))
+        fl!(
+            "rate-mib",
+            value = format!("{:.1}", value / (1024.0 * 1024.0))
+        )
     } else if value >= 1024.0 {
         fl!("rate-kib", value = format!("{:.1}", value / 1024.0))
     } else {
@@ -380,7 +394,10 @@ mod tests {
         let mut small = Row::process(&Process::stub(40, 1, "d"));
         big.sort_memory = 100;
         small.sort_memory = 1;
-        assert_eq!(compare(&big, &small, Column::Memory), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare(&big, &small, Column::Memory),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

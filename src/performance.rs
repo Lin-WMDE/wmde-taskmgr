@@ -15,10 +15,11 @@ use cosmic::iced::{Alignment, Color, Length};
 use cosmic::prelude::*;
 use cosmic::widget;
 use wmde_sysmon::graph::{Colors, Kind, Metrics, Ring, Strip, Style};
-use wmde_sysmon::probe::{Probe, Sample, Sources};
+use wmde_sysmon::probe::{DeviceRate, Probe, Sample, Sources};
 
 use crate::memory::Report;
 
+use crate::devices::{Catalog, DiskKind, LinkKind};
 use crate::facts::{Facts, Live};
 use crate::fl;
 
@@ -64,34 +65,28 @@ fn tile_columns(n: usize) -> usize {
     n.isqrt().max(1)
 }
 
-/// The devices the rail lists, in the reference's order.
+/// One row of the rail, in the reference's order.
+///
+/// The processor and the memory are the machine; a disk and a card are one of however many
+/// the machine has, and carry their place in the probe's list. That list is sorted by name
+/// and only changes when hardware does, so the number is stable between rescans - and
+/// [`valid`] catches the rescan where it is not.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Device {
     #[default]
     Cpu,
     Memory,
-    Disk,
-    Network,
+    Disk(usize),
+    Network(usize),
 }
 
 impl Device {
-    pub const ALL: [Self; 4] = [Self::Cpu, Self::Memory, Self::Disk, Self::Network];
-
     const fn kind(self) -> Kind {
         match self {
             Self::Cpu => Kind::Cpu,
             Self::Memory => Kind::Memory,
-            Self::Disk => Kind::Disk,
-            Self::Network => Kind::Network,
-        }
-    }
-
-    fn title(self) -> String {
-        match self {
-            Self::Cpu => fl!("device-cpu"),
-            Self::Memory => fl!("device-memory"),
-            Self::Disk => fl!("device-disk"),
-            Self::Network => fl!("device-network"),
+            Self::Disk(_) => Kind::Disk,
+            Self::Network(_) => Kind::Network,
         }
     }
 
@@ -102,6 +97,29 @@ impl Device {
     /// was, so there is no fixed ceiling to label and none is invented.
     fn scale_top(self) -> Option<String> {
         matches!(self, Self::Cpu | Self::Memory).then(|| percent(1.0))
+    }
+}
+
+/// The rail for a machine with this many disks and cards.
+fn rail(disks: usize, nets: usize) -> Vec<Device> {
+    let mut out = Vec::with_capacity(2 + disks + nets);
+    out.push(Device::Cpu);
+    out.push(Device::Memory);
+    out.extend((0..disks).map(Device::Disk));
+    out.extend((0..nets).map(Device::Network));
+    out
+}
+
+/// Keeps a selection pointing at something that still exists.
+///
+/// A stick pulled out or a cable unplugged shortens the list under the selection, and the
+/// numbers of everything after it shift by one. Rather than follow a device that may not be
+/// back, the page falls to the processor - the one row that is always there.
+const fn valid(device: Device, disks: usize, nets: usize) -> Device {
+    match device {
+        Device::Disk(i) if i >= disks => Device::Cpu,
+        Device::Network(i) if i >= nets => Device::Cpu,
+        other => other,
     }
 }
 
@@ -138,6 +156,20 @@ fn rings() -> Rings {
     std::array::from_fn(|i| Ring::new(Kind::ALL[i].bands().len(), WINDOW))
 }
 
+/// Pushes this tick onto one history per device, growing the set to match the probe.
+///
+/// A change of length clears them all: a device is addressed by its place in the list, and a
+/// list that gained or lost one has moved everything after it. Hardware appearing is rare
+/// enough that a minute of history is the right thing to spend on getting it right.
+fn push_devices(sets: &mut Vec<Rings>, kind: Kind, meters: &[DeviceRate]) {
+    if sets.len() != meters.len() {
+        *sets = (0..meters.len()).map(|_| rings()).collect();
+    }
+    for (set, meter) in sets.iter_mut().zip(meters) {
+        set[kind.index()].push(&[meter.rate[0] as f32, meter.rate[1] as f32]);
+    }
+}
+
 /// One colour per device, taken from the theme's roles.
 ///
 /// The panel applet colours a band by **what the load is** - user against system against
@@ -149,18 +181,21 @@ fn rings() -> Rings {
 /// `CpuUser`, `MemUsed`, `NetIn`, `DiskRead`. Under [`Style::Curve`] the curve, its fill and
 /// its grid all take the colour of that first band whatever else is stacked under it, so
 /// nothing else needs overriding.
+///
+/// The colour is of the kind and not of the device: every disk is drawn green and every card
+/// red, however many there are. The reference does the same, and a palette of four roles has
+/// no fifth green to give the second drive anyway.
 fn device_colors() -> Colors {
     let theme = cosmic::theme::active();
     let palette = theme.cosmic();
     let mut colors = Colors::default();
-    for device in Device::ALL {
-        let color = Color::from(match device {
-            Device::Cpu => palette.accent_color(),
-            Device::Memory => palette.warning_color(),
-            Device::Disk => palette.success_color(),
-            Device::Network => palette.destructive_color(),
-        });
-        colors.bands[device.kind().bands()[0] as usize] = Some(color);
+    for (kind, color) in [
+        (Kind::Cpu, palette.accent_color()),
+        (Kind::Memory, palette.warning_color()),
+        (Kind::Disk, palette.success_color()),
+        (Kind::Network, palette.destructive_color()),
+    ] {
+        colors.bands[kind.bands()[0] as usize] = Some(Color::from(color));
     }
     colors
 }
@@ -171,6 +206,13 @@ pub struct Performance {
     history: Rings,
     /// One set per logical processor, filled only while the per-core view is on.
     cores: Vec<Rings>,
+    /// One set per disk and one per network card, in the probe's order.
+    disks: Vec<Rings>,
+    nets: Vec<Rings>,
+    /// The rail as it stands: the two machine-wide rows, then a row per device.
+    devices: Vec<Device>,
+    /// What those disks and cards are. Read once each, when they first appear.
+    catalog: Catalog,
     /// A cache per plot: the large one, then the rail thumbnails, then the core tiles.
     caches: Vec<canvas::Cache>,
     /// Rebuilt every tick: the palette moves when the theme does, and a colour taken once at
@@ -206,7 +248,13 @@ impl Performance {
             last: Sample::default(),
             history: rings(),
             cores: Vec::new(),
-            caches: (0..=Device::ALL.len()).map(|_| canvas::Cache::new()).collect(),
+            disks: Vec::new(),
+            nets: Vec::new(),
+            // The two rows that are there before anything has been sampled. The first tick
+            // adds the devices.
+            devices: rail(0, 0),
+            catalog: Catalog::default(),
+            caches: (0..=2).map(|_| canvas::Cache::new()).collect(),
             colors: device_colors(),
             device: Device::default(),
             // The reference opens on the tiles, and a machine busy on one core out of sixteen
@@ -249,8 +297,21 @@ impl Performance {
             s.mem[1] as f32 / total,
             s.mem[2] as f32 / total,
         ]);
-        self.history[Kind::Network.index()].push(&[s.net[0] as f32, s.net[1] as f32]);
-        self.history[Kind::Disk.index()].push(&[s.disk[0] as f32, s.disk[1] as f32]);
+        // The machine-wide disk and network rings are left alone: the rail draws one row per
+        // device, and nothing is left to draw their sum. The panel applet still does, out of
+        // its own probe.
+        self.catalog.refresh(
+            self.probe.disks().iter().map(|meter| &*meter.name),
+            self.probe.nets().iter().map(|meter| &*meter.name),
+        );
+        push_devices(&mut self.disks, Kind::Disk, self.probe.disks());
+        push_devices(&mut self.nets, Kind::Network, self.probe.nets());
+
+        let devices = rail(self.disks.len(), self.nets.len());
+        if devices != self.devices {
+            self.devices = devices;
+            self.device = valid(self.device, self.disks.len(), self.nets.len());
+        }
 
         if self.per_core {
             let cores = self.probe.cpu_cores().len();
@@ -264,7 +325,7 @@ impl Performance {
             self.cores.clear();
         }
 
-        let needed = 1 + Device::ALL.len() + self.cores.len();
+        let needed = 1 + self.devices.len() + self.cores.len();
         while self.caches.len() < needed {
             self.caches.push(canvas::Cache::new());
         }
@@ -321,13 +382,13 @@ impl Performance {
     pub fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
-        let mut rail = widget::column::with_capacity(Device::ALL.len()).spacing(RAIL_GAP);
-        for (i, device) in Device::ALL.into_iter().enumerate() {
+        let mut rail = widget::column::with_capacity(self.devices.len()).spacing(RAIL_GAP);
+        for (i, device) in self.devices.iter().copied().enumerate() {
             // No grid in a thumbnail: the reference draws none, and six by ten inside eighty
             // by fifty-four pixels would be a hatch rather than a grid.
             let thumb = self.plot(
                 device.kind(),
-                &self.history,
+                self.rings_of(device),
                 1 + i,
                 THUMB_HEIGHT,
                 Style::Curve { cols: 1, rows: 1 },
@@ -341,7 +402,7 @@ impl Performance {
                     // is, and what it is doing. None of them wraps - a wrapped line makes one
                     // row taller than its neighbours and the rail stops reading as a list.
                     widget::column::with_capacity(3)
-                        .push(widget::text::body(device.title()).wrapping(Wrapping::None))
+                        .push(widget::text::body(self.title(device)).wrapping(Wrapping::None))
                         .push(widget::text::caption(self.detail(device)).wrapping(Wrapping::None))
                         .push(widget::text::caption(self.reading(device)).wrapping(Wrapping::None)),
                 );
@@ -359,15 +420,17 @@ impl Performance {
             );
         }
 
-        // Heading line: the device on the left, what the processor is on the right, against
-        // the far edge of the plot. The model used to sit in the facts panel, where it cost a
-        // row of a column that has rows to spare.
+        // Heading line: the device on the left, what it is on the right, against the far edge
+        // of the plot. The processor model used to sit in the facts panel, where it cost a
+        // row of a column that has rows to spare; a disk and a card put there what the rail
+        // row has no width for - the drive's node and size, the card's full name.
         let mut heading = widget::row::with_capacity(3)
             .align_y(Alignment::Center)
-            .push(widget::text::title3(self.device.title()))
+            .push(widget::text::title3(self.title(self.device)))
             .push(widget::Space::new().width(Length::Fill));
-        if self.device == Device::Cpu && !self.facts.model.is_empty() {
-            heading = heading.push(widget::text::body(self.facts.model.clone()));
+        let aside = self.aside(self.device);
+        if !aside.is_empty() {
+            heading = heading.push(widget::text::body(aside));
         }
 
         // Axis labels, above the plot and not below it: the window on the left, the top of
@@ -385,7 +448,7 @@ impl Performance {
             } else {
                 self.plot(
                     self.device.kind(),
-                    &self.history,
+                    self.rings_of(self.device),
                     0,
                     PLOT_HEIGHT,
                     Style::Curve {
@@ -408,6 +471,14 @@ impl Performance {
         if self.device == Device::Memory {
             main = main.push(self.memory_panel());
         }
+
+        // The rail scrolls: a machine with six drives has eight rows at seventy-four pixels,
+        // which is more than the window has. The spacing keeps the text out from under the
+        // bar, and only while the bar is showing - the usual four rows keep the full width.
+        let rail = rail
+            .apply(widget::scrollable)
+            .spacing(spacing.space_xxxs)
+            .height(Length::Fill);
 
         let mut row = widget::row::with_capacity(4)
             .push(widget::container(rail).width(Length::Fixed(RAIL_WIDTH)))
@@ -713,7 +784,7 @@ impl Performance {
                             widget::container(self.plot(
                                 Kind::Cpu,
                                 set,
-                                1 + Device::ALL.len() + i,
+                                1 + self.devices.len() + i,
                                 tile,
                                 Style::Curve {
                                     cols: GRID_COLS,
@@ -734,6 +805,73 @@ impl Performance {
         .into()
     }
 
+    /// The history a row draws. Falls back to the machine-wide set rather than panicking on
+    /// a number the last tick invalidated - the next tick puts the selection right.
+    fn rings_of(&self, device: Device) -> &Rings {
+        match device {
+            Device::Disk(i) => self.disks.get(i),
+            Device::Network(i) => self.nets.get(i),
+            _ => None,
+        }
+        .unwrap_or(&self.history)
+    }
+
+    /// The kernel's name for a device, which is the key to everything else about it.
+    fn node(&self, device: Device) -> &str {
+        match device {
+            Device::Disk(i) => self.probe.disks().get(i),
+            Device::Network(i) => self.probe.nets().get(i),
+            _ => None,
+        }
+        .map_or("", |meter| &meter.name)
+    }
+
+    /// The top line of a rail row, and the heading of the page.
+    ///
+    /// A drive is called by its model, the way the reference calls it: a name off the box the
+    /// user bought. A card has no such name short enough for a rail row - `pci.ids` spells it
+    /// out in fifty characters - so it goes by what it is, and the full name sits beside the
+    /// heading where there is room for it.
+    fn title(&self, device: Device) -> String {
+        match device {
+            Device::Cpu => fl!("device-cpu"),
+            Device::Memory => fl!("device-memory"),
+            Device::Disk(_) => {
+                let node = self.node(device);
+                self.catalog
+                    .disk(node)
+                    .map(|disk| disk.model.clone())
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or_else(|| node.to_owned())
+            }
+            Device::Network(_) => match self.catalog.interface(self.node(device)) {
+                Some(card) if card.kind == LinkKind::Wireless => fl!("device-net-wireless"),
+                _ => fl!("device-net-ethernet"),
+            },
+        }
+    }
+
+    /// What sits against the right edge of the heading: the identity that did not fit in the
+    /// rail. Empty for a device that has nothing more to say.
+    fn aside(&self, device: Device) -> String {
+        match device {
+            Device::Cpu => self.facts.model.clone(),
+            Device::Memory => String::new(),
+            Device::Disk(_) => {
+                let node = self.node(device);
+                match self.catalog.disk(node).filter(|disk| disk.size > 0) {
+                    Some(disk) => fl!("device-disk-node", node = node, size = size(disk.size)),
+                    None => node.to_owned(),
+                }
+            }
+            Device::Network(_) => self
+                .catalog
+                .interface(self.node(device))
+                .map(|card| card.model.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     /// The middle line of a rail row: what the device is.
     fn detail(&self, device: Device) -> String {
         let s = &self.last;
@@ -744,20 +882,86 @@ impl Performance {
                 used = size(s.mem[0]),
                 total = size(s.mem_total)
             ),
-            Device::Disk => fl!("summary-disk-read", value = rate(s.disk[0])),
-            Device::Network => fl!("summary-net-rx", value = rate(s.net[0])),
+            // Everything the machine did not publish is left out rather than written as a
+            // blank: a drive with no model reads as its node and its size, and a card with
+            // no negotiated speed as its node alone.
+            Device::Disk(_) => {
+                let node = self.node(device);
+                let mut what = Vec::with_capacity(2);
+                if let Some(disk) = self.catalog.disk(node) {
+                    if let Some(kind) = disk_kind(disk.kind) {
+                        what.push(kind);
+                    }
+                    if disk.size > 0 {
+                        what.push(size(disk.size));
+                    }
+                }
+                match what.is_empty() {
+                    true => node.to_owned(),
+                    false => fl!("device-node", what = what.join(", "), node = node),
+                }
+            }
+            Device::Network(_) => {
+                let node = self.node(device);
+                match self
+                    .catalog
+                    .interface(node)
+                    .and_then(|card| card.speed_mbps)
+                    .map(link_speed)
+                {
+                    Some(speed) => fl!("device-node", what = speed, node = node),
+                    None => node.to_owned(),
+                }
+            }
         }
     }
 
     /// The bottom line of a rail row: what it is doing right now.
+    ///
+    /// Both rates on one line, as the reference puts them - it writes `S: 0 R: 0 Kbps` in the
+    /// width one figure would take spelled out.
     fn reading(&self, device: Device) -> String {
         let s = &self.last;
         match device {
             Device::Cpu => percent(s.cpu.iter().sum()),
             Device::Memory => percent(s.mem[0] as f32 / s.mem_total.max(1) as f32),
-            Device::Disk => fl!("summary-disk-write", value = rate(s.disk[1])),
-            Device::Network => fl!("summary-net-tx", value = rate(s.net[1])),
+            Device::Disk(i) => {
+                let meter = self.probe.disks().get(i);
+                let lanes = meter.map_or([0.0; 2], |meter| meter.rate);
+                fl!(
+                    "summary-disk-rate",
+                    read = rate(lanes[0]),
+                    write = rate(lanes[1])
+                )
+            }
+            Device::Network(i) => {
+                let meter = self.probe.nets().get(i);
+                let lanes = meter.map_or([0.0; 2], |meter| meter.rate);
+                fl!("summary-net-rate", rx = rate(lanes[0]), tx = rate(lanes[1]))
+            }
         }
+    }
+}
+
+/// What to call a drive of this kind, or nothing when the machine would not say.
+fn disk_kind(kind: DiskKind) -> Option<String> {
+    match kind {
+        DiskKind::Nvme => Some(fl!("device-disk-nvme")),
+        DiskKind::Ssd => Some(fl!("device-disk-ssd")),
+        DiskKind::Hdd => Some(fl!("device-disk-hdd")),
+        DiskKind::Removable => Some(fl!("device-disk-removable")),
+        DiskKind::Unknown => None,
+    }
+}
+
+/// A negotiated link speed, in the unit it is usually spoken in: gigabits once it reaches a
+/// thousand megabits, which is where every wired card of the last twenty years sits.
+fn link_speed(mbps: u32) -> String {
+    let gbit: u32 = mbps / 1000;
+    if mbps >= 1000 && mbps.is_multiple_of(1000) {
+        fl!("link-gbit", value = gbit)
+    } else {
+        fl!("link-mbit", value = mbps)
     }
 }
 
@@ -842,7 +1046,10 @@ fn size(bytes: u64) -> String {
             value = format!("{:.1}", value / (1024.0 * 1024.0 * 1024.0))
         )
     } else if value >= 1024.0 * 1024.0 {
-        fl!("size-mib", value = format!("{:.0}", value / (1024.0 * 1024.0)))
+        fl!(
+            "size-mib",
+            value = format!("{:.0}", value / (1024.0 * 1024.0))
+        )
     } else {
         fl!("size-kib", value = format!("{:.0}", value / 1024.0))
     }
@@ -877,10 +1084,22 @@ mod tests {
     /// `ceil(sqrt(n))` gave, and measuring `ref/mission-center/cpu-dark.png` ruled it out.
     #[test]
     fn the_grid_is_never_wider_than_it_is_tall() {
-        for (n, cols) in [(1, 1), (2, 1), (4, 2), (6, 2), (9, 3), (12, 3), (16, 4), (20, 4)] {
+        for (n, cols) in [
+            (1, 1),
+            (2, 1),
+            (4, 2),
+            (6, 2),
+            (9, 3),
+            (12, 3),
+            (16, 4),
+            (20, 4),
+        ] {
             assert_eq!(tile_columns(n), cols, "{n} processors");
             let rows = n.div_ceil(cols);
-            assert!(rows >= cols, "{n} processors give {rows} rows of {cols} columns");
+            assert!(
+                rows >= cols,
+                "{n} processors give {rows} rows of {cols} columns"
+            );
         }
     }
 
@@ -908,7 +1127,48 @@ mod tests {
     fn a_scale_is_labelled_only_where_it_has_a_top() {
         assert!(Device::Cpu.scale_top().is_some());
         assert!(Device::Memory.scale_top().is_some());
-        assert!(Device::Disk.scale_top().is_none());
-        assert!(Device::Network.scale_top().is_none());
+        assert!(Device::Disk(0).scale_top().is_none());
+        assert!(Device::Network(3).scale_top().is_none());
+    }
+
+    /// The two machine-wide rows first, then a row per device, in the probe's order.
+    #[test]
+    fn the_rail_is_the_machine_then_its_devices() {
+        assert_eq!(rail(0, 0), [Device::Cpu, Device::Memory]);
+        assert_eq!(
+            rail(2, 1),
+            [
+                Device::Cpu,
+                Device::Memory,
+                Device::Disk(0),
+                Device::Disk(1),
+                Device::Network(0),
+            ]
+        );
+    }
+
+    /// A device that went away does not leave the page pointing past the end of the list.
+    #[test]
+    fn a_selection_never_outlives_its_device() {
+        assert_eq!(valid(Device::Disk(1), 2, 1), Device::Disk(1));
+        assert_eq!(valid(Device::Disk(1), 1, 1), Device::Cpu);
+        assert_eq!(valid(Device::Network(0), 1, 0), Device::Cpu);
+        // The two that are always there are never touched, whatever is plugged in.
+        assert_eq!(valid(Device::Memory, 0, 0), Device::Memory);
+    }
+
+    /// A gigabit link is spoken of in gigabits, and anything else in what it negotiated.
+    ///
+    /// The unit itself is not asserted on: it is localized, and the catalogue the test runs
+    /// against is whatever the machine's language is. The number is the same in every one.
+    #[test]
+    fn a_link_speed_is_read_in_the_unit_it_is_spoken_in() {
+        assert!(
+            !link_speed(1000).contains("1000"),
+            "a whole gigabit is spoken in gigabits"
+        );
+        // 2.5 gigabit is not a whole number of them, so it stays in megabits.
+        assert!(link_speed(2500).contains("2500"));
+        assert!(link_speed(100).contains("100"));
     }
 }

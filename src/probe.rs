@@ -171,7 +171,11 @@ impl Probe {
         };
 
         for entry in dir.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
                 continue;
             };
             self.update(pid, dt, cpu_delta);
@@ -243,8 +247,8 @@ impl Probe {
 
         let status = read_into(&mut self.path, &mut self.buf_status, pid, "status")
             .then(|| parse_status(&self.buf_status));
-        let io = read_into(&mut self.path, &mut self.buf_io, pid, "io")
-            .then(|| parse_io(&self.buf_io));
+        let io =
+            read_into(&mut self.path, &mut self.buf_io, pid, "io").then(|| parse_io(&self.buf_io));
         if io.is_none() && !self.warned_io {
             self.warned_io = true;
             tracing::warn!(
@@ -498,7 +502,11 @@ mod tests {
             Some("wmde-applet-bluetooth")
         );
         assert_eq!(
-            full_name("wmde-files-appl", b"/usr/bin/wmde-files-applet\0--desktop\0").as_deref(),
+            full_name(
+                "wmde-files-appl",
+                b"/usr/bin/wmde-files-applet\0--desktop\0"
+            )
+            .as_deref(),
             Some("wmde-files-applet"),
             "the path is not the name"
         );
@@ -548,14 +556,18 @@ mod tests {
     fn data_never_goes_below_zero() {
         // VmExe and VmLib are virtual, so on a process whose file pages are mostly paged out
         // they exceed RssFile. The metric must floor at the anonymous part, not wrap.
-        let raw = b"RssAnon:\t  1000 kB\nRssFile:\t   100 kB\nVmExe:\t  9000 kB\nVmLib:\t 9000 kB\n";
+        let raw =
+            b"RssAnon:\t  1000 kB\nRssFile:\t   100 kB\nVmExe:\t  9000 kB\nVmLib:\t 9000 kB\n";
         let s = parse_status(raw);
         assert_eq!(s.anon + s.file.saturating_sub(s.exe + s.lib), 1000);
     }
 
     #[test]
     fn cmdline_joins_arguments_without_a_trailing_space() {
-        assert_eq!(&*parse_cmdline(b"/usr/bin/foo\0--bar\0baz\0"), "/usr/bin/foo --bar baz");
+        assert_eq!(
+            &*parse_cmdline(b"/usr/bin/foo\0--bar\0baz\0"),
+            "/usr/bin/foo --bar baz"
+        );
         assert_eq!(&*parse_cmdline(b""), "");
     }
 
@@ -570,7 +582,10 @@ mod tests {
     fn walks_the_running_system() {
         let mut probe = Probe::new();
         probe.sample();
-        assert!(probe.processes().count() > 1, "a running system has more than one process");
+        assert!(
+            probe.processes().count() > 1,
+            "a running system has more than one process"
+        );
 
         let me = std::process::id();
         let this = probe.get(me).expect("the test process is in the list");

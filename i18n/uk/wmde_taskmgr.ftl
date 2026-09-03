@@ -37,18 +37,24 @@ no-value = -
 
 device-cpu = Процесор
 device-memory = Памʼять
-device-disk = Диск
-device-network = Мережа
+device-net-ethernet = Ethernet
+device-net-wireless = Wi-Fi
+device-disk-nvme = NVMe
+device-disk-ssd = SSD
+device-disk-hdd = HDD
+device-disk-removable = Змінний
+device-node = { $what } ({ $node })
+device-disk-node = { $node }, { $size }
+link-mbit = { $value } Мбіт/с
+link-gbit = { $value } Гбіт/с
 
 last-seconds = останні { $count } секунд
 show-per-core = За логічними процесорами
 show-overall = Загалом
 
 summary-memory = { $used } з { $total }
-summary-disk-read = читання { $value }
-summary-disk-write = запис { $value }
-summary-net-rx = прийом { $value }
-summary-net-tx = передача { $value }
+summary-disk-rate = Ч: { $read }  З: { $write }
+summary-net-rate = Пр: { $rx }  Пер: { $tx }
 
 search = Пошук
 
