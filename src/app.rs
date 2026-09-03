@@ -254,7 +254,7 @@ impl App {
         let generation = self.generation;
 
         let search = widget::text_input::search_input(fl!("search"), &self.search)
-            .width(Length::Fixed(260.0))
+            .width(Length::Fill)
             .on_input(Message::Search)
             .on_clear(Message::SearchClear);
 
@@ -264,9 +264,14 @@ impl App {
             Message::Scope,
         );
 
+        // Fill on the row as well as on the field. A Shrink row resolves a Fill child
+        // against its own intrinsic width, and the search box would keep the width of its
+        // placeholder. The dropdown is Shrink by default and keeps the width it had; it
+        // simply ends up against the right edge.
         let bar = widget::row::with_capacity(2)
             .spacing(spacing.space_xs)
             .align_y(cosmic::iced::Alignment::Center)
+            .width(Length::Fill)
             .push(search)
             .push(scope);
 
