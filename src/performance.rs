@@ -402,6 +402,10 @@ impl Performance {
             .push(
                 widget::container(main)
                     .width(Length::Fill)
+                    // Fill, so `core_tiles` is handed the height the page actually has. It
+                    // needs a real number: the tiles keep their shape until the shape would
+                    // push the grid off the bottom, and that test is against this height.
+                    .height(Length::Fill)
                     .padding(spacing.space_s),
             );
         if self.device == Device::Cpu {
@@ -591,10 +595,6 @@ impl Performance {
             }
             grid.into()
         })
-        // Shrink, not the default Fill: the grid inside settles at the height the tile shape
-        // asks for, and a Fill box around it leaves the difference as dead space under the
-        // last row instead of closing up behind it.
-        .height(Length::Shrink)
         .into()
     }
 
