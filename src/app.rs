@@ -301,7 +301,12 @@ impl App {
                     )
                 })
             })
+            // Without a spacing the scrollbar is drawn over the content: the table is laid
+            // out across the whole width, and the last column ends up underneath the bar.
+            // With one, the room is reserved in the layout - and only while the bar is
+            // showing, so a short list keeps its full width.
             .apply(widget::scrollable)
+            .spacing(spacing.space_xxxs)
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -476,8 +481,11 @@ impl cosmic::Application for App {
         match self.page() {
             Page::Processes => self.processes_view(),
             Page::Performance => self.performance.view().map(Message::Performance),
+            // Spacing for the same reason the process table has one: without it the last
+            // column is drawn under the scrollbar.
             Page::Users => widget::table(&self.users)
                 .apply(widget::scrollable)
+                .spacing(cosmic::theme::spacing().space_xxxs)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
