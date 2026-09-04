@@ -111,6 +111,11 @@ impl Names {
 /// people at five terminals. What a process belongs to is its audit session id, `p.session`,
 /// matched against the logins logind knows.
 ///
+/// A login holds everything running inside it, whoever owns it. The session leader of an ssh
+/// login is `sshd` and belongs to root; of a graphical one, whatever started the session.
+/// Splitting those out by account number would put a root row named after somebody else
+/// beside every login on the page.
+///
 /// Processes outside every login - the user's service manager and everything under it,
 /// pipewire, the portals - are folded into one background row per account. That row is kept
 /// to real accounts, `current` aside: root owns the whole system outside any login, and a
@@ -125,6 +130,14 @@ pub fn rows<'a>(
     range: Range,
     current: u32,
 ) -> Vec<Row> {
+    /// What a row stands for: a login, by its audit session id, or what an account runs
+    /// outside every login.
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    enum Key {
+        Login(u32),
+        Outside(u32),
+    }
+
     struct Fold {
         pids: Vec<u32>,
         cpu: f32,
@@ -139,13 +152,14 @@ pub fn rows<'a>(
         .map(|session| (session.audit, session))
         .collect();
 
-    let mut by_key: HashMap<(u32, Option<u32>), Fold> = HashMap::new();
+    let mut by_key: HashMap<Key, Fold> = HashMap::new();
     for p in processes {
-        let login = p.session.filter(|id| logins.contains_key(id));
-        if login.is_none() && !range.holds(p.uid) && p.uid != current {
-            continue;
-        }
-        let fold = by_key.entry((p.uid, login)).or_insert_with(|| Fold {
+        let key = match p.session.filter(|id| logins.contains_key(id)) {
+            Some(audit) => Key::Login(audit),
+            None if range.holds(p.uid) || p.uid == current => Key::Outside(p.uid),
+            None => continue,
+        };
+        let fold = by_key.entry(key).or_insert_with(|| Fold {
             pids: Vec::new(),
             cpu: 0.0,
             rss: 0,
@@ -169,34 +183,35 @@ pub fn rows<'a>(
     // leaves /proc/PID/sessionid empty for everything. The page then reads as it did before
     // logins were told apart - a row per account - and says so with a dash rather than
     // calling a person's whole desktop a background service.
-    let anything_signed_in = by_key.keys().any(|(_, login)| login.is_some());
+    let anything_signed_in = by_key.keys().any(|key| matches!(key, Key::Login(_)));
     let outside = if anything_signed_in {
         fl!("session-background")
     } else {
         fl!("no-value")
     };
 
-    let entries: Vec<(u32, Option<&Session>, Fold)> = by_key
-        .into_iter()
-        .map(|((uid, login), fold)| (uid, login.and_then(|id| logins.get(&id).copied()), fold))
-        .collect();
-
     // Two logins of one account that read the same - two ssh connections from one address -
     // are told apart by their terminal, and by the session number when they have none.
     let mut twins: HashMap<(u32, String), usize> = HashMap::new();
-    for (uid, session, _) in &entries {
-        if let Some(session) = session {
-            *twins.entry((*uid, session.label())).or_default() += 1;
+    for key in by_key.keys() {
+        if let Key::Login(audit) = key
+            && let Some(session) = logins.get(audit)
+        {
+            *twins.entry((session.uid, session.label())).or_default() += 1;
         }
     }
 
-    let mut out: Vec<Row> = entries
+    let mut out: Vec<Row> = by_key
         .into_iter()
-        .map(|(uid, session, f)| {
-            let (name, label) = match session {
-                Some(session) => {
+        .map(|(key, f)| {
+            let (name, label) = match key {
+                Key::Login(audit) => {
+                    let session = logins[&audit];
                     let label = session.label();
-                    let label = if twins.get(&(uid, label.clone())).is_some_and(|n| *n > 1) {
+                    let label = if twins
+                        .get(&(session.uid, label.clone()))
+                        .is_some_and(|n| *n > 1)
+                    {
                         fl!("session-node", what = label, node = session.node())
                     } else {
                         label
@@ -204,13 +219,13 @@ pub fn rows<'a>(
                     // logind knows the name of an account that /etc/passwd has never heard
                     // of, which is the ordinary case for a network directory.
                     let name = if session.user.is_empty() {
-                        names.get(uid)
+                        names.get(session.uid)
                     } else {
                         session.user.clone()
                     };
                     (name, label)
                 }
-                None => (names.get(uid), outside.clone()),
+                Key::Outside(uid) => (names.get(uid), outside.clone()),
             };
             Row::user(name, label, f.pids, f.cpu, f.rss, f.data, f.threads, f.disk)
         })
@@ -347,6 +362,34 @@ mod tests {
         assert_eq!(rows.len(), 2, "the desktop and the background");
         let counts: Vec<usize> = rows.iter().map(|r| r.pids.len()).collect();
         assert!(counts.contains(&2) && counts.iter().sum::<usize>() == 4);
+    }
+
+    /// The leader of an ssh login is `sshd` and belongs to root; of a graphical one, whatever
+    /// started the session. Both belong to the login they lead, and the row is named after the
+    /// account that logged in.
+    #[test]
+    fn a_login_holds_what_runs_inside_it_whoever_owns_it() {
+        let sessions = [ssh(20, 1000, "172.17.6.2", "pts/1")];
+        let procs = [
+            // sshd, and the shell it started.
+            process(100, 0, Some(20)),
+            process(101, 1000, Some(20)),
+        ];
+
+        let rows = rows(
+            procs.iter(),
+            &sessions,
+            &Names(HashMap::new()),
+            Range::default(),
+            1000,
+        );
+        assert_eq!(rows.len(), 1, "one login, one row");
+        assert_eq!(rows[0].pids.len(), 2);
+        assert_eq!(
+            rows[0].label(),
+            "1000 (2)",
+            "the row is named after the account that logged in, not after root"
+        );
     }
 
     /// A daemon of a system account is not a person; a system account over ssh is.
