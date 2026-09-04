@@ -59,6 +59,9 @@ pub struct Interface {
     pub kind: LinkKind,
     /// `Intel 82540EM Gigabit Ethernet Controller`, or the driver name, or empty.
     pub model: String,
+    /// The same name with the words every card shares taken out: `Intel 82540EM`. Empty when
+    /// nothing but the vendor was left, and then the card goes by its link type instead.
+    pub short: String,
     /// Megabits per second the link negotiated. `None` while the link is down, and for
     /// anything that has no meaningful speed to report.
     pub speed_mbps: Option<u32>,
@@ -145,8 +148,17 @@ fn disk_kind(name: &str, removable: Option<bool>, rotational: Option<bool>) -> D
     }
 }
 
-fn read_interface(name: &str, model: Option<String>) -> Interface {
+fn read_interface(name: &str, pci: Option<(String, String)>) -> Interface {
     let path = Path::new(NET_DIR).join(name);
+    // Without the name table there is the driver, which is short already and needs no
+    // shortening - `e1000` says as much as it is going to say.
+    let (model, short) = match pci {
+        Some((vendor, device)) => (format!("{vendor} {device}"), shorten(&vendor, &device)),
+        None => {
+            let driver = link_basename(&path.join("device/driver")).unwrap_or_default();
+            (driver.clone(), driver)
+        }
+    };
     Interface {
         // A wireless card in managed mode reports ARPHRD_ETHER like any other, so `type` is
         // no help and the wireless directory is the test.
@@ -155,9 +167,8 @@ fn read_interface(name: &str, model: Option<String>) -> Interface {
         } else {
             LinkKind::Ethernet
         },
-        model: model
-            .or_else(|| link_basename(&path.join("device/driver")))
-            .unwrap_or_default(),
+        model,
+        short,
         // `speed` answers with an error while the link is down and with -1 where the number
         // would be meaningless; both come back as no speed at all.
         speed_mbps: read_trimmed(&path.join("speed"))
@@ -166,12 +177,13 @@ fn read_interface(name: &str, model: Option<String>) -> Interface {
     }
 }
 
-/// Names for these interfaces out of the PCI table, in the order they were given.
+/// Vendor and device names for these interfaces out of the PCI table, in the order they were
+/// given: `("Intel", "82540EM Gigabit Ethernet Controller")`.
 ///
 /// One pass over the file for however many cards are asked about: it is a megabyte and a
 /// half, and a machine can hold several cards. `None` for an interface whose ids are missing
 /// - a USB adapter publishes `idVendor` instead - or absent from the table.
-fn pci_models(names: &[&str]) -> Vec<Option<String>> {
+fn pci_models(names: &[&str]) -> Vec<Option<(String, String)>> {
     let wanted: Vec<Option<(String, String)>> = names.iter().map(|name| pci_ids(name)).collect();
     if wanted.iter().all(Option::is_none) {
         return vec![None; names.len()];
@@ -192,7 +204,7 @@ fn pci_models(names: &[&str]) -> Vec<Option<String>> {
 /// The walk itself, over a table handed in. Split from the reading so that the shape of the
 /// file - vendor at the margin, device one tab in, subsystem two - is under test; whether a
 /// machine has the file is not something a test can arrange.
-fn lookup(table: &str, wanted: &[Option<(String, String)>]) -> Vec<Option<String>> {
+fn lookup(table: &str, wanted: &[Option<(String, String)>]) -> Vec<Option<(String, String)>> {
     let mut out = vec![None; wanted.len()];
     let mut vendor_id = "";
     let mut vendor_name = "";
@@ -217,7 +229,7 @@ fn lookup(table: &str, wanted: &[Option<(String, String)>]) -> Vec<Option<String
                         continue;
                     };
                     if want_vendor == vendor_id && want_device == id {
-                        *slot = Some(format!("{} {name}", short_vendor(vendor_name)));
+                        *slot = Some((short_vendor(vendor_name).to_owned(), name.to_owned()));
                     }
                 }
             }
@@ -236,6 +248,55 @@ fn pci_ids(name: &str) -> Option<(String, String)> {
             .map(|id| format!("{id:04x}"))
     };
     Some((id("vendor")?, id("device")?))
+}
+
+/// The words the table gives half the cards alike.
+///
+/// A card is named by a sentence there - `Ethernet Controller I226-V`, `82540EM Gigabit
+/// Ethernet Controller` - and most of that sentence is what every card has in common. A rail
+/// row has width for about twenty-eight characters, so what it keeps has to be the part that
+/// tells one card from another.
+///
+/// `Wireless` and `Wi-Fi` are deliberately not here: they are short, and they say what the
+/// card is.
+const SHARED_WORDS: [&str; 17] = [
+    "adapter",
+    "adapters",
+    "card",
+    "chipset",
+    "connection",
+    "connections",
+    "controller",
+    "controllers",
+    "ethernet",
+    "express",
+    "family",
+    "gigabit",
+    "interface",
+    "lan",
+    "network",
+    "nic",
+    "pci",
+];
+
+/// `Intel` + `Ethernet Controller I226-V` -> `Intel I226-V`.
+///
+/// Empty when the words left nothing behind: `Ethernet Controller` with no model in it says
+/// no more than the row's own link type does, and the caller falls back to that.
+fn shorten(vendor: &str, device: &str) -> String {
+    let kept: Vec<&str> = device
+        .split_whitespace()
+        .filter(|word| {
+            let bare = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            !SHARED_WORDS.contains(&bare.as_str())
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!("{vendor} {}", kept.join(" "))
 }
 
 /// `Intel Corporation` -> `Intel`. The legal suffix is noise in a row eighty pixels wide, and
@@ -309,6 +370,36 @@ mod tests {
         assert_eq!(disk_kind("sdc", None, None), DiskKind::Unknown);
     }
 
+    /// The four names the two real machines actually produce, and the one that shortens to
+    /// nothing. Every kept name fits the twenty-eight characters a rail row has.
+    #[test]
+    fn a_card_keeps_the_half_of_its_name_that_tells_it_apart() {
+        for (vendor, device, want) in [
+            ("Intel", "Ethernet Controller I226-V", "Intel I226-V"),
+            (
+                "Intel",
+                "82540EM Gigabit Ethernet Controller",
+                "Intel 82540EM",
+            ),
+            (
+                "Intel",
+                "700 Series Chipset Family CNVi Wi-Fi",
+                "Intel 700 Series CNVi Wi-Fi",
+            ),
+            (
+                "Realtek",
+                "RTL8111/8168/8411 PCI Express Gigabit Ethernet Controller",
+                "Realtek RTL8111/8168/8411",
+            ),
+        ] {
+            let short = shorten(vendor, device);
+            assert_eq!(short, want);
+            assert!(short.chars().count() <= 28, "{short} will not fit the rail");
+        }
+        // Nothing but shared words: the row goes by its link type instead.
+        assert_eq!(shorten("Intel", "Ethernet Controller"), "");
+    }
+
     #[test]
     fn a_vendor_loses_its_legal_suffix_and_nothing_else() {
         assert_eq!(short_vendor("Intel Corporation"), "Intel");
@@ -336,7 +427,10 @@ C 03  Display controller
                 .iter()
                 .map(|(vendor, device)| Some(((*vendor).to_owned(), (*device).to_owned())))
                 .collect();
-        let found = lookup(table, &wanted);
+        let found: Vec<Option<String>> = lookup(table, &wanted)
+            .into_iter()
+            .map(|pair| pair.map(|(vendor, device)| format!("{vendor} {device}")))
+            .collect();
         assert_eq!(
             found[0].as_deref(),
             Some("Intel 82540EM Gigabit Ethernet Controller")

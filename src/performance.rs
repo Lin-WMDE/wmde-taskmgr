@@ -54,6 +54,15 @@ const FACT_KEY_WIDTH: f32 = 148.0;
 /// Gap between rows of the rail. Below any theme step on purpose: at 74 px a row is tall
 /// enough that four pixels of air read as a gap between blocks rather than between rows.
 const RAIL_GAP: u16 = 2;
+/// Characters a rail row's name has room for.
+///
+/// Measured on the running window rather than guessed: the text column of a row is 177 px -
+/// from where the text starts to the divider - and the interface face averages 5.8 px a
+/// character, which leaves about twenty-eight once the row's padding and the scrollbar's
+/// spacing are taken off. The face is proportional, so this is the average and not a
+/// guarantee; a name of wide letters is still cut by the widget, which is what the ellipsis
+/// warns about.
+const TITLE_CHARS: usize = 28;
 
 /// Columns for `n` per-core tiles: a square-ish grid, never wider than it is tall.
 ///
@@ -108,6 +117,19 @@ fn rail(disks: usize, nets: usize) -> Vec<Device> {
     out.extend((0..disks).map(Device::Disk));
     out.extend((0..nets).map(Device::Network));
     out
+}
+
+/// Cuts a name that will not fit and marks the cut, so that a clipped name reads as clipped
+/// and not as the whole of it.
+///
+/// The ellipsis is one character - the same one the rest of the stack writes - and it takes
+/// the place of the last character kept, not a place of its own.
+fn elide(text: &str, chars: usize) -> String {
+    if chars == 0 || text.chars().count() <= chars {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(chars - 1).collect();
+    format!("{}…", head.trim_end())
 }
 
 /// Keeps a selection pointing at something that still exists.
@@ -409,6 +431,7 @@ impl Performance {
     pub fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
 
+        let titles = self.titles();
         let mut rail = widget::column::with_capacity(self.devices.len()).spacing(RAIL_GAP);
         for (i, device) in self.devices.iter().copied().enumerate() {
             let thumb = self.thumb(device.kind(), self.rings_of(device), 1 + i);
@@ -421,7 +444,7 @@ impl Performance {
                     // is, and what it is doing. None of them wraps - a wrapped line makes one
                     // row taller than its neighbours and the rail stops reading as a list.
                     widget::column::with_capacity(3)
-                        .push(widget::text::body(self.title(device)).wrapping(Wrapping::None))
+                        .push(widget::text::body(titles[i].clone()).wrapping(Wrapping::None))
                         .push(widget::text::caption(self.detail(device)).wrapping(Wrapping::None))
                         .push(widget::text::caption(self.reading(device)).wrapping(Wrapping::None)),
                 );
@@ -443,6 +466,7 @@ impl Performance {
         // of the plot. The processor model used to sit in the facts panel, where it cost a
         // row of a column that has rows to spare; a disk and a card put there what the rail
         // row has no width for - the drive's node and size, the card's full name.
+        // The heading has the width the rail has not, so it carries the name whole.
         let mut heading = widget::row::with_capacity(3)
             .align_y(Alignment::Center)
             .push(widget::text::title3(self.title(self.device)))
@@ -863,11 +887,49 @@ impl Performance {
                     .filter(|model| !model.is_empty())
                     .unwrap_or_else(|| node.to_owned())
             }
-            Device::Network(_) => match self.catalog.interface(self.node(device)) {
-                Some(card) if card.kind == LinkKind::Wireless => fl!("device-net-wireless"),
-                _ => fl!("device-net-ethernet"),
-            },
+            // The shortened name, which is the model without the words every card in the
+            // table shares. A card the table does not name, or names in shared words only,
+            // goes by its link type - which is what the reference calls it anyway.
+            Device::Network(_) => {
+                let card = self.catalog.interface(self.node(device));
+                match card
+                    .map(|card| card.short.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(short) => short.to_owned(),
+                    None if card.is_some_and(|card| card.kind == LinkKind::Wireless) => {
+                        fl!("device-net-wireless")
+                    }
+                    None => fl!("device-net-ethernet"),
+                }
+            }
         }
+    }
+
+    /// The rail's names, cut to the width a row has and told apart where two came out alike.
+    ///
+    /// Two cards of one model, or two drives of one part number, would otherwise carry the
+    /// same name twice and be distinguishable only by the line beneath. Names are built for
+    /// the whole rail at once because that comparison needs all of them.
+    fn titles(&self) -> Vec<String> {
+        let base: Vec<String> = self.devices.iter().map(|d| self.title(*d)).collect();
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(i, device)| {
+                let twin = self.devices.iter().enumerate().any(|(j, other)| {
+                    j != i && other.kind() == device.kind() && base[j] == base[i]
+                });
+                let node = self.node(*device);
+                if twin && !node.is_empty() {
+                    // The node is what makes them two, so it is what the name has to keep.
+                    let room = TITLE_CHARS.saturating_sub(node.chars().count() + 3);
+                    fl!("device-node", what = elide(&base[i], room), node = node)
+                } else {
+                    elide(&base[i], TITLE_CHARS)
+                }
+            })
+            .collect()
     }
 
     /// What sits against the right edge of the heading: the identity that did not fit in the
@@ -1174,6 +1236,22 @@ mod tests {
         assert_eq!(valid(Device::Network(0), 1, 0), Device::Cpu);
         // The two that are always there are never touched, whatever is plugged in.
         assert_eq!(valid(Device::Memory, 0, 0), Device::Memory);
+    }
+
+    /// A name that fits is left alone; one that does not ends in an ellipsis and never
+    /// exceeds the room measured for it.
+    #[test]
+    fn a_name_too_long_for_the_rail_says_so() {
+        assert_eq!(elide("Intel I226-V", TITLE_CHARS), "Intel I226-V");
+        // Exactly the budget is not too long.
+        let exact: String = "x".repeat(TITLE_CHARS);
+        assert_eq!(elide(&exact, TITLE_CHARS), exact);
+
+        let cut = elide("Intel 82540EM Gigabit Ethernet Controller", TITLE_CHARS);
+        assert_eq!(cut.chars().count(), TITLE_CHARS);
+        assert!(cut.ends_with('…'));
+        // The cut lands inside the text, not against a space left dangling before the mark.
+        assert!(!cut.contains(" …"));
     }
 
     /// A gigabit link is spoken of in gigabits, and anything else in what it negotiated.
