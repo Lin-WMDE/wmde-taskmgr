@@ -10,6 +10,7 @@ use cosmic::widget::table::{ItemCategory, ItemInterface};
 
 use crate::fl;
 use crate::probe::Process;
+use crate::users::Whose;
 
 /// The columns, in the order the list shows them.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -165,8 +166,14 @@ pub struct Row {
     /// Processes this row would end. Empty for a section heading.
     pub pids: Vec<u32>,
     name: String,
+    /// The account on its own, without the process count the name carries. Kept for the scope
+    /// control, which offers one entry per row of the users page.
+    account: String,
     /// Which login this row stands for. Empty on a process row.
     session: String,
+    /// What this row stands for on the users page, and what the scope control filters by.
+    /// `None` on a process row.
+    whose: Option<Whose>,
     cpu: String,
     memory: String,
     data: String,
@@ -193,7 +200,9 @@ impl Row {
             kind: Kind::Process,
             pids: vec![p.pid],
             name: p.name.to_string(),
+            account: String::new(),
             session: String::new(),
+            whose: None,
             cpu: percent(p.cpu),
             memory: size(p.rss),
             data: size(p.data),
@@ -217,8 +226,9 @@ impl Row {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn user(
-        name: String,
+        account: String,
         session: String,
+        whose: Whose,
         pids: Vec<u32>,
         cpu: f32,
         rss: u64,
@@ -228,8 +238,10 @@ impl Row {
     ) -> Self {
         Self {
             kind: Kind::Account,
-            name: format!("{name} ({})", pids.len()),
+            name: format!("{account} ({})", pids.len()),
+            account,
             session,
+            whose: Some(whose),
             cpu: percent(cpu),
             memory: size(rss),
             data: size(data),
@@ -254,6 +266,23 @@ impl Row {
     #[must_use]
     pub fn session_label(&self) -> &str {
         &self.session
+    }
+
+    /// What this row stands for, or nothing when it stands for a single process.
+    #[must_use]
+    pub fn whose(&self) -> Option<Whose> {
+        self.whose
+    }
+
+    /// How the row reads in the scope control: the account and the login, without the process
+    /// count, which changes every second and would make the list jump under the pointer.
+    #[must_use]
+    pub fn choice(&self) -> String {
+        fl!(
+            "scope-login",
+            account = self.account.clone(),
+            session = self.session.clone()
+        )
     }
 
     /// What the name column shows. Only the tests need to read it back.

@@ -74,6 +74,11 @@ search = Пошук
 scope-mine = Мої процеси
 scope-users = Усі користувацькі
 scope-all = Разом із ядерними
+# Друга частина списку охоплення: по пункту на кожен рядок вкладки користувачів.
+scope-logins = Вхід
+scope-login = { $account } - { $session }
+
+show-processes = Показати процеси
 
 fact-utilization = Завантаження
 fact-speed = Швидкість

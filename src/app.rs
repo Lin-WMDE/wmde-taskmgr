@@ -9,7 +9,7 @@ use std::time::Duration;
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::{Length, Subscription};
 use cosmic::prelude::*;
-use cosmic::widget::{self, segmented_button, table};
+use cosmic::widget::{self, dropdown, segmented_button, table};
 
 use crate::fl;
 
@@ -19,7 +19,7 @@ use crate::performance::{self, Performance};
 use crate::probe::Probe;
 use crate::processes::{Column, Row};
 use crate::sessions::{self, Session};
-use crate::users::{self, Names, Range};
+use crate::users::{self, Names, Range, Whose};
 use crate::windows::{self, Event, Window};
 
 /// How often the list is rebuilt. The reference calls this speed "normal", and a release
@@ -40,16 +40,24 @@ pub enum Scope {
     Users,
     /// Kernel threads as well.
     All,
+    /// One row of the users page: a login, or what an account runs outside every login.
+    /// Answers "what is root running over ssh", which no level of the three can.
+    Whose(Whose),
 }
 
 impl Scope {
-    const ALL: [Self; 3] = [Self::Mine, Self::Users, Self::All];
+    /// The nesting levels, which are the whole of the first part of the control. The rest of
+    /// it is built from the rows of the users page and changes as people come and go.
+    const LEVELS: [Self; 3] = [Self::Mine, Self::Users, Self::All];
 
+    /// How a level reads. A login names itself, out of the row it came from - see
+    /// `Row::choice`.
     fn label(self) -> String {
         match self {
             Self::Mine => fl!("scope-mine"),
             Self::Users => fl!("scope-users"),
             Self::All => fl!("scope-all"),
+            Self::Whose(_) => String::new(),
         }
     }
 }
@@ -82,8 +90,10 @@ pub enum Message {
     /// The search box changed.
     Search(String),
     SearchClear,
-    /// The scope control changed, by position in [`Scope::ALL`].
-    Scope(usize),
+    /// The scope control changed.
+    Scope(Scope),
+    /// Show the processes of one row of the users page, and go to the list to do it.
+    Show(Whose),
     /// A tab in the title bar was picked.
     Tab(segmented_button::Entity),
     Sort(Column),
@@ -135,7 +145,9 @@ pub struct App {
     search: String,
     scope: Scope,
     /// Built once: the dropdown wants a slice that outlives the view.
-    scope_labels: Vec<String>,
+    /// The scope control: the three levels, and under them one entry per row of the users
+    /// page. Rebuilt with that page, so a login that ends leaves the list with it.
+    scopes: dropdown::multi::Model<String, Scope>,
     /// The column the list is ordered by, and whether the natural order is reversed. Natural
     /// means largest first for a number and alphabetical for a name, which is the order each
     /// column is actually read in.
@@ -186,6 +198,9 @@ impl App {
                 Scope::Mine => p.uid == uid,
                 Scope::Users => !p.is_kernel_thread(),
                 Scope::All => true,
+                // Kernel threads pass this too when they belong to the account picked, which
+                // is the point: the filter names whose processes to show, not how deep to go.
+                Scope::Whose(whose) => whose.holds(p, &self.sessions),
             })
             .filter(|p| {
                 needle.is_empty()
@@ -253,14 +268,36 @@ impl App {
     }
 
     fn rebuild_users(&mut self) {
-        let mut model = table::Model::new(Column::USERS.to_vec());
-        for row in users::rows(
+        let rows = users::rows(
             self.probe.processes(),
             &self.sessions,
             &self.user_names,
             self.user_range,
             self.uid,
-        ) {
+        );
+
+        // The scope control offers exactly these rows, so the two never disagree about who is
+        // logged in. A pick that lost its row - somebody logged out - falls back to the
+        // person at the machine rather than filtering on a login that is gone.
+        let logins: Vec<(String, Scope)> = rows
+            .iter()
+            .filter_map(|row| Some((row.choice(), Scope::Whose(row.whose()?))))
+            .collect();
+        self.scope = valid(self.scope, &logins);
+
+        let mut scopes = dropdown::multi::model();
+        scopes.insert(dropdown::multi::list(
+            None,
+            Scope::LEVELS.iter().map(|s| (s.label(), *s)).collect(),
+        ));
+        if !logins.is_empty() {
+            scopes.insert(dropdown::multi::list(Some(fl!("scope-logins")), logins));
+        }
+        scopes.selected = Some(self.scope);
+        self.scopes = scopes;
+
+        let mut model = table::Model::new(Column::USERS.to_vec());
+        for row in rows {
             let _ = model.insert(row);
         }
         model.set_sort(Some((Column::Data, false)));
@@ -277,11 +314,7 @@ impl App {
             .on_input(Message::Search)
             .on_clear(Message::SearchClear);
 
-        let scope = widget::dropdown(
-            &self.scope_labels,
-            Scope::ALL.iter().position(|s| *s == self.scope),
-            Message::Scope,
-        );
+        let scope = widget::dropdown::multi::dropdown(&self.scopes, Message::Scope);
 
         // Fill on the row as well as on the field. A Shrink row resolves a Fill child
         // against its own intrinsic width, and the search box would keep the width of its
@@ -384,7 +417,7 @@ impl cosmic::Application for App {
             uid: rustix::process::getuid().as_raw(),
             search: String::new(),
             scope: Scope::default(),
-            scope_labels: Scope::ALL.iter().map(|s| s.label()).collect(),
+            scopes: dropdown::multi::model(),
             // Memory first: it is the column the list is opened for.
             sort: (Column::Data, false),
             table: table::Model::new(Column::ALL.to_vec()),
@@ -433,8 +466,11 @@ impl cosmic::Application for App {
         match message {
             Message::Tick => {
                 self.probe.sample();
-                self.rebuild();
+                // The users page first: it is what tells a scope that its login has gone, and
+                // the list below must not be built against a filter that no longer names
+                // anybody.
                 self.rebuild_users();
+                self.rebuild();
                 self.performance.counts = (
                     self.probe.processes().count(),
                     self.probe.processes().map(|p| p.threads).sum(),
@@ -482,9 +518,25 @@ impl cosmic::Application for App {
                     return widget::text_input::focus(SEARCH.clone());
                 }
             }
-            Message::Scope(index) => {
-                self.scope = Scope::ALL.get(index).copied().unwrap_or_default();
+            Message::Scope(scope) => {
+                self.scope = scope;
+                self.scopes.selected = Some(scope);
                 self.rebuild();
+            }
+            Message::Show(whose) => {
+                self.scope = Scope::Whose(whose);
+                self.scopes.selected = Some(self.scope);
+                self.rebuild();
+                // Through the tab message rather than by activating the tab here: arriving at
+                // the process list hands the keyboard to the search field, and a second way in
+                // would behave differently from the strip.
+                let processes = self
+                    .tabs
+                    .iter()
+                    .find(|entity| self.tabs.data::<Page>(*entity) == Some(&Page::Processes));
+                if let Some(entity) = processes {
+                    return self.update(Message::Tab(entity));
+                }
             }
             Message::Sort(column) => {
                 // The same column again turns the order around; a different one starts from
@@ -521,6 +573,19 @@ impl cosmic::Application for App {
             // Spacing for the same reason the process table has one: without it the last
             // column is drawn under the scrollbar.
             Page::Users => widget::table(&self.users)
+                // One item, and it carries the row's own key rather than the selection: the
+                // menu opens over a row whether or not the table took the click.
+                .item_context(|row: &Row| {
+                    let whose = row.whose()?;
+                    Some(widget::menu::items(
+                        &HashMap::new(),
+                        vec![widget::menu::Item::Button(
+                            fl!("show-processes"),
+                            None,
+                            Action::Show(whose),
+                        )],
+                    ))
+                })
                 .apply(widget::scrollable)
                 .spacing(cosmic::theme::spacing().space_xxxs)
                 .width(Length::Fill)
@@ -538,6 +603,16 @@ impl cosmic::Application for App {
     }
 }
 
+/// A pick that lost its row - somebody logged out, an account stopped running anything - falls
+/// back to the person at the machine. Filtering on a login that is gone would leave an empty
+/// list and no way to see that this is why.
+fn valid(scope: Scope, logins: &[(String, Scope)]) -> Scope {
+    match scope {
+        Scope::Whose(_) if !logins.iter().any(|(_, offered)| *offered == scope) => Scope::default(),
+        _ => scope,
+    }
+}
+
 /// What the context menu over a row offers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
@@ -545,6 +620,8 @@ enum Action {
     EndTask(u32),
     /// `SIGKILL`: it does not.
     KillTask(u32),
+    /// Go to the process list, filtered to one row of the users page.
+    Show(Whose),
 }
 
 impl widget::menu::Action for Action {
@@ -554,6 +631,7 @@ impl widget::menu::Action for Action {
         match *self {
             Self::EndTask(pid) => Message::EndTask { pid, force: false },
             Self::KillTask(pid) => Message::EndTask { pid, force: true },
+            Self::Show(whose) => Message::Show(whose),
         }
     }
 }
@@ -576,7 +654,7 @@ mod tests {
                 .filter(|p| match scope {
                     Scope::Mine => p.uid == uid,
                     Scope::Users => !p.is_kernel_thread(),
-                    Scope::All => true,
+                    _ => true,
                 })
                 .count()
         };
@@ -589,10 +667,35 @@ mod tests {
         assert!(count(Scope::Users) <= count(Scope::All));
     }
 
+    /// A login that ends takes the filter with it.
+    #[test]
+    fn a_scope_never_outlives_its_login() {
+        let offered = vec![
+            ("softer - ssh".to_owned(), Scope::Whose(Whose::Login(20))),
+            (
+                "softer - background".to_owned(),
+                Scope::Whose(Whose::Outside(1000)),
+            ),
+        ];
+
+        assert_eq!(
+            valid(Scope::Whose(Whose::Login(20)), &offered),
+            Scope::Whose(Whose::Login(20)),
+            "a login still listed is kept"
+        );
+        assert_eq!(
+            valid(Scope::Whose(Whose::Login(21)), &offered),
+            Scope::Mine,
+            "a login that has gone falls back"
+        );
+        // The three levels are not rows and are never withdrawn.
+        assert_eq!(valid(Scope::All, &[]), Scope::All);
+    }
+
     /// Every scope has a label in the catalogue, and no two read the same.
     #[test]
     fn every_scope_is_named() {
-        let labels: Vec<String> = Scope::ALL.iter().map(|s| s.label()).collect();
+        let labels: Vec<String> = Scope::LEVELS.iter().map(|s| s.label()).collect();
         assert!(labels.iter().all(|l| !l.is_empty()));
         let mut sorted = labels.clone();
         sorted.sort();

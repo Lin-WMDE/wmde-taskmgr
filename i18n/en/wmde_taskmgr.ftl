@@ -76,6 +76,11 @@ search = Search
 scope-mine = My processes
 scope-users = All users
 scope-all = Including kernel
+# The second part of the scope list: one entry per row of the users page.
+scope-logins = Login
+scope-login = { $account } - { $session }
+
+show-processes = Show processes
 
 fact-utilization = Utilization
 fact-speed = Speed

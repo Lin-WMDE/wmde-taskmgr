@@ -105,6 +105,34 @@ impl Names {
     }
 }
 
+/// What a row of this page stands for: a login, by its audit session id, or what an account
+/// runs outside every login.
+///
+/// Doubles as the filter of the process list: the scope control offers one entry per row, and
+/// `App::rebuild` keeps the processes this names.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Whose {
+    Login(u32),
+    Outside(u32),
+}
+
+impl Whose {
+    /// Whether a process belongs to what this names.
+    ///
+    /// `logins` is the set of audit ids that logind still calls a login; a process whose
+    /// session is not among them counts as outside, wherever it came from.
+    #[must_use]
+    pub fn holds(self, p: &Process, logins: &[Session]) -> bool {
+        let login = p
+            .session
+            .filter(|id| logins.iter().any(|session| session.audit == *id));
+        match self {
+            Self::Login(audit) => login == Some(audit),
+            Self::Outside(uid) => login.is_none() && p.uid == uid,
+        }
+    }
+}
+
 /// One row per login, heaviest first.
 ///
 /// A row is one login, not one account: five ssh connections under the same name are five
@@ -130,14 +158,6 @@ pub fn rows<'a>(
     range: Range,
     current: u32,
 ) -> Vec<Row> {
-    /// What a row stands for: a login, by its audit session id, or what an account runs
-    /// outside every login.
-    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-    enum Key {
-        Login(u32),
-        Outside(u32),
-    }
-
     struct Fold {
         pids: Vec<u32>,
         cpu: f32,
@@ -152,11 +172,11 @@ pub fn rows<'a>(
         .map(|session| (session.audit, session))
         .collect();
 
-    let mut by_key: HashMap<Key, Fold> = HashMap::new();
+    let mut by_key: HashMap<Whose, Fold> = HashMap::new();
     for p in processes {
         let key = match p.session.filter(|id| logins.contains_key(id)) {
-            Some(audit) => Key::Login(audit),
-            None if range.holds(p.uid) || p.uid == current => Key::Outside(p.uid),
+            Some(audit) => Whose::Login(audit),
+            None if range.holds(p.uid) || p.uid == current => Whose::Outside(p.uid),
             None => continue,
         };
         let fold = by_key.entry(key).or_insert_with(|| Fold {
@@ -183,7 +203,7 @@ pub fn rows<'a>(
     // leaves /proc/PID/sessionid empty for everything. The page then reads as it did before
     // logins were told apart - a row per account - and says so with a dash rather than
     // calling a person's whole desktop a background service.
-    let anything_signed_in = by_key.keys().any(|key| matches!(key, Key::Login(_)));
+    let anything_signed_in = by_key.keys().any(|key| matches!(key, Whose::Login(_)));
     let outside = if anything_signed_in {
         fl!("session-background")
     } else {
@@ -194,7 +214,7 @@ pub fn rows<'a>(
     // are told apart by their terminal, and by the session number when they have none.
     let mut twins: HashMap<(u32, String), usize> = HashMap::new();
     for key in by_key.keys() {
-        if let Key::Login(audit) = key
+        if let Whose::Login(audit) = key
             && let Some(session) = logins.get(audit)
         {
             *twins.entry((session.uid, session.label())).or_default() += 1;
@@ -205,7 +225,7 @@ pub fn rows<'a>(
         .into_iter()
         .map(|(key, f)| {
             let (name, label) = match key {
-                Key::Login(audit) => {
+                Whose::Login(audit) => {
                     let session = logins[&audit];
                     let label = session.label();
                     let label = if twins
@@ -225,9 +245,11 @@ pub fn rows<'a>(
                     };
                     (name, label)
                 }
-                Key::Outside(uid) => (names.get(uid), outside.clone()),
+                Whose::Outside(uid) => (names.get(uid), outside.clone()),
             };
-            Row::user(name, label, f.pids, f.cpu, f.rss, f.data, f.threads, f.disk)
+            Row::user(
+                name, label, key, f.pids, f.cpu, f.rss, f.data, f.threads, f.disk,
+            )
         })
         .collect();
     out.sort_by(|a, b| crate::processes::compare(a, b, Column::Data));
@@ -390,6 +412,51 @@ mod tests {
             "1000 (2)",
             "the row is named after the account that logged in, not after root"
         );
+    }
+
+    /// The filter of the process list is the row of this page, and it keeps what runs inside
+    /// the login - `sshd` from root included - and nothing else.
+    #[test]
+    fn a_login_filter_keeps_what_runs_inside_it() {
+        let sessions = [ssh(20, 1000, "172.17.6.2", "pts/1")];
+        let inside_sshd = process(100, 0, Some(20));
+        let inside_shell = process(101, 1000, Some(20));
+        let other_login = process(102, 1000, Some(21));
+        let outside = process(103, 1000, None);
+
+        let login = Whose::Login(20);
+        assert!(login.holds(&inside_sshd, &sessions));
+        assert!(login.holds(&inside_shell, &sessions));
+        assert!(!login.holds(&other_login, &sessions), "another login");
+        assert!(!login.holds(&outside, &sessions), "outside every login");
+
+        // Outside is the other half of the same split: what the login row does not hold, the
+        // background row of that account does.
+        let background = Whose::Outside(1000);
+        assert!(background.holds(&outside, &sessions));
+        assert!(!background.holds(&inside_shell, &sessions));
+        // A session logind no longer lists is not a login, so what carried it counts as
+        // outside - the same rule the page folds by.
+        assert!(background.holds(&other_login, &sessions));
+    }
+
+    /// The scope control offers the rows of this page, named the way the page names them.
+    #[test]
+    fn a_choice_reads_like_the_row_it_came_from() {
+        let sessions = [ssh(20, 1000, "172.17.6.2", "pts/1")];
+        let procs = [process(100, 1000, Some(20))];
+
+        let rows = rows(
+            procs.iter(),
+            &sessions,
+            &Names(HashMap::new()),
+            Range::default(),
+            1000,
+        );
+        let choice = rows[0].choice();
+        assert!(choice.contains("1000"), "the account: {choice}");
+        assert!(choice.contains("172.17.6.2"), "the login: {choice}");
+        assert_eq!(rows[0].whose(), Some(Whose::Login(20)));
     }
 
     /// A daemon of a system account is not a person; a system account over ssh is.
