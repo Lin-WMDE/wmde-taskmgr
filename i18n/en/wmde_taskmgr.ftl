@@ -11,6 +11,7 @@ column-data = Data
 column-disk = Disk
 column-threads = Threads
 column-pid = PID
+column-session = Session
 
 section-applications = Applications
 section-background = Background processes
@@ -32,6 +33,18 @@ rate-b = { $value } B/s
 rate-kib = { $value } KiB/s
 rate-mib = { $value } MiB/s
 rate-gib = { $value } GiB/s
+
+# Which login this is. A row on the users page is one login, not one account.
+session-desktop = Desktop
+session-console = Console { $tty }
+session-console-plain = Console
+session-remote = ssh { $host }
+session-remote-service = { $service } { $host }
+session-remote-plain = ssh
+# What runs outside every login: portals, pipewire, systemd --user.
+session-background = Background services
+# Two identical logins of one account are told apart by a node: pts/2 or the session number.
+session-node = { $what } ({ $node })
 
 no-value = -
 

@@ -18,6 +18,7 @@ static SEARCH: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("search")
 use crate::performance::{self, Performance};
 use crate::probe::Probe;
 use crate::processes::{Column, Row};
+use crate::sessions::{self, Session};
 use crate::users::{self, Names, Range};
 use crate::windows::{self, Event, Window};
 
@@ -68,6 +69,9 @@ pub enum Message {
     /// Something arrived from the bus: a new window list, or a second launch asking this
     /// copy to show itself.
     Bus(Event),
+    /// logind's list of logins, as it stands. Arrives on start and whenever one comes or
+    /// goes, never on the tick: sessions change on the scale of people, not of seconds.
+    Sessions(Vec<Session>),
     /// The row clicked, together with the generation of the model it was clicked in.
     ///
     /// An `Entity` is a slotmap key, and a fresh model hands out the very same keys in the
@@ -149,6 +153,9 @@ pub struct App {
     /// Where regular accounts begin, out of `/etc/login.defs`.
     user_range: Range,
     users: table::SingleSelectModel<Row, Column>,
+    /// Who is logged in. Empty until logind answers, and empty for good on a machine that has
+    /// no logind - the users page then folds by account, the way it did before.
+    sessions: Vec<Session>,
 }
 
 impl App {
@@ -246,8 +253,14 @@ impl App {
     }
 
     fn rebuild_users(&mut self) {
-        let mut model = table::Model::new(Column::ALL.to_vec());
-        for row in users::rows(&self.probe, &self.user_names, self.user_range, self.uid) {
+        let mut model = table::Model::new(Column::USERS.to_vec());
+        for row in users::rows(
+            self.probe.processes(),
+            &self.sessions,
+            &self.user_names,
+            self.user_range,
+            self.uid,
+        ) {
             let _ = model.insert(row);
         }
         model.set_sort(Some((Column::Data, false)));
@@ -381,7 +394,8 @@ impl cosmic::Application for App {
             performance: Performance::new(),
             user_names: Names::load(),
             user_range: Range::load(),
-            users: table::Model::new(Column::ALL.to_vec()),
+            users: table::Model::new(Column::USERS.to_vec()),
+            sessions: Vec::new(),
         };
         // The first walk has nothing to take a delta against, so every rate reads zero until
         // the second one a second later. Taking it here means the window is not empty when
@@ -430,6 +444,12 @@ impl cosmic::Application for App {
             // Kept, not used: the flat list needs nothing from it, and the folding in
             // `group` needs all of it the moment it is wired back up.
             Message::Bus(Event::Windows(windows)) => self.windows = windows,
+            Message::Sessions(sessions) => {
+                self.sessions = sessions;
+                // Straight away rather than at the next tick: a login that has just arrived
+                // is exactly what somebody is looking at the page to see.
+                self.rebuild_users();
+            }
             Message::Bus(Event::Present) => {
                 if let Some(id) = self.core.main_window_id() {
                     return cosmic::iced::window::gain_focus(id);
@@ -513,6 +533,7 @@ impl cosmic::Application for App {
         Subscription::batch([
             cosmic::iced::time::every(TICK).map(|_| Message::Tick),
             Subscription::run(windows::subscription).map(Message::Bus),
+            Subscription::run(sessions::subscription).map(Message::Sessions),
         ])
     }
 }

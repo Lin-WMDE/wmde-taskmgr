@@ -48,6 +48,12 @@ pub struct Process {
     pub name: Box<str>,
     /// Full command line, arguments separated by spaces. Empty for a kernel thread.
     pub cmdline: Box<str>,
+    /// Which login the process belongs to: the audit session id, set by PAM at login and
+    /// inherited by every child. `None` for what runs outside any login - kernel threads,
+    /// system daemons, and the user manager with everything under it.
+    ///
+    /// Read once, with the command line: a process keeps the session it was born into.
+    pub session: Option<u32>,
 
     pub threads: u32,
     /// Resident set, KiB. Counts a shared page once per process holding it, so the column
@@ -94,6 +100,7 @@ impl Process {
             starttime: 0,
             name: name.into(),
             cmdline: format!("/usr/bin/{name}").into_boxed_str(),
+            session: None,
             threads: 1,
             rss: 0,
             data: 0,
@@ -114,6 +121,7 @@ pub struct Probe {
     /// single shared buffer would mean copying one of them back out again.
     buf_stat: Vec<u8>,
     buf_status: Vec<u8>,
+    buf_session: Vec<u8>,
     buf_io: Vec<u8>,
     buf_cmdline: Vec<u8>,
     path: String,
@@ -138,6 +146,8 @@ impl Probe {
             procs: HashMap::new(),
             buf_stat: Vec::with_capacity(512),
             buf_status: Vec::with_capacity(2048),
+            // A decimal number and a newline, never more.
+            buf_session: Vec::with_capacity(16),
             buf_io: Vec::with_capacity(512),
             buf_cmdline: Vec::with_capacity(1024),
             path: String::with_capacity(64),
@@ -223,6 +233,9 @@ impl Probe {
             } else {
                 Box::default()
             };
+            let session = read_into(&mut self.path, &mut self.buf_session, pid, "sessionid")
+                .then(|| parse_session(&self.buf_session))
+                .flatten();
             self.procs.insert(
                 pid,
                 Process {
@@ -232,6 +245,7 @@ impl Probe {
                     starttime: stat.starttime,
                     name,
                     cmdline,
+                    session,
                     threads: 0,
                     rss: 0,
                     data: 0,
@@ -346,6 +360,19 @@ struct Stat<'a> {
 
 /// `comm` is the process's own name and may hold spaces and parentheses, so the split point
 /// is the LAST `)` in the line, never the first.
+/// The audit session id of `/proc/PID/sessionid`.
+///
+/// `4294967295` is the kernel's "no session", written by anything that never went through a
+/// login - and by every process on a kernel built without audit. Both read as `None` here,
+/// and the page falls back to one row per account.
+fn parse_session(raw: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    match text.parse::<u32>() {
+        Ok(u32::MAX) | Err(_) => None,
+        Ok(id) => Some(id),
+    }
+}
+
 fn parse_stat(raw: &[u8]) -> Option<Stat<'_>> {
     let open = raw.iter().position(|b| *b == b'(')?;
     let close = raw.iter().rposition(|b| *b == b')')?;

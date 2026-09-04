@@ -9,6 +9,7 @@ mod memory;
 mod performance;
 mod probe;
 mod processes;
+mod sessions;
 mod single;
 mod tabs;
 mod users;

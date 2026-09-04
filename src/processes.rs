@@ -16,6 +16,9 @@ use crate::probe::Process;
 pub enum Column {
     #[default]
     Name,
+    /// Which login the row stands for. Only the users page shows it; a process row leaves it
+    /// empty, because a process is already named by the account row above it.
+    Session,
     Cpu,
     Memory,
     Data,
@@ -25,6 +28,7 @@ pub enum Column {
 }
 
 impl Column {
+    /// The process list.
     pub const ALL: [Self; 7] = [
         Self::Name,
         Self::Cpu,
@@ -33,6 +37,18 @@ impl Column {
         Self::Disk,
         Self::Threads,
         Self::Pid,
+    ];
+
+    /// The users page. The login takes the place of the pid, which on a row standing for a
+    /// whole login was never anything but a dash.
+    pub const USERS: [Self; 7] = [
+        Self::Name,
+        Self::Session,
+        Self::Cpu,
+        Self::Memory,
+        Self::Data,
+        Self::Disk,
+        Self::Threads,
     ];
 }
 
@@ -92,6 +108,7 @@ impl Column {
     fn title(self) -> String {
         match self {
             Self::Name => fl!("column-name"),
+            Self::Session => fl!("column-session"),
             Self::Cpu => fl!("column-cpu"),
             Self::Memory => fl!("column-memory"),
             Self::Data => fl!("column-data"),
@@ -108,6 +125,9 @@ impl ItemCategory for Column {
     fn width(&self) -> Length {
         match self {
             Self::Name => Length::Fill,
+            // Wide enough for "ssh " and an address, the longest of the four things this
+            // column says.
+            Self::Session => Length::Fixed(140.0),
             Self::Cpu => Length::Fixed(60.0),
             Self::Memory | Self::Data => Length::Fixed(92.0),
             Self::Disk => Length::Fixed(96.0),
@@ -120,7 +140,7 @@ impl ItemCategory for Column {
     /// of the next and the column can be read down. Only the name reads from the left.
     fn align(&self) -> Horizontal {
         match self {
-            Self::Name => Horizontal::Left,
+            Self::Name | Self::Session => Horizontal::Left,
             _ => Horizontal::Right,
         }
     }
@@ -145,6 +165,8 @@ pub struct Row {
     /// Processes this row would end. Empty for a section heading.
     pub pids: Vec<u32>,
     name: String,
+    /// Which login this row stands for. Empty on a process row.
+    session: String,
     cpu: String,
     memory: String,
     data: String,
@@ -171,6 +193,7 @@ impl Row {
             kind: Kind::Process,
             pids: vec![p.pid],
             name: p.name.to_string(),
+            session: String::new(),
             cpu: percent(p.cpu),
             memory: size(p.rss),
             data: size(p.data),
@@ -186,10 +209,16 @@ impl Row {
         }
     }
 
-    /// One account on the users page.
+    /// One login on the users page.
+    ///
+    /// `session` is what the login is - a desktop, a terminal, an address it came from - and
+    /// is built in `crate::users`, which is also where two logins that read the same are told
+    /// apart.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn user(
         name: String,
+        session: String,
         pids: Vec<u32>,
         cpu: f32,
         rss: u64,
@@ -200,6 +229,7 @@ impl Row {
         Self {
             kind: Kind::Account,
             name: format!("{name} ({})", pids.len()),
+            session,
             cpu: percent(cpu),
             memory: size(rss),
             data: size(data),
@@ -211,9 +241,19 @@ impl Row {
             sort_data: data,
             sort_disk: disk.map_or(0.0, |d| d[0] + d[1]),
             sort_threads: threads,
-            sort_pid: 0,
+            // Not shown on this page, and still the last tie-break of the sort: two logins
+            // holding the same figures would otherwise swap places every second, because the
+            // fold they come out of is a HashMap.
+            sort_pid: pids.iter().copied().min().unwrap_or(0),
             pids,
         }
+    }
+
+    /// What the session column shows. Read back by the tests and by nothing else.
+    #[cfg(test)]
+    #[must_use]
+    pub fn session_label(&self) -> &str {
+        &self.session
     }
 
     /// What the name column shows. Only the tests need to read it back.
@@ -240,6 +280,7 @@ impl ItemInterface<Column> for Row {
     fn get_text(&self, category: Column) -> Cow<'static, str> {
         match category {
             Column::Name => self.name.clone().into(),
+            Column::Session => self.session.clone().into(),
             Column::Cpu => self.cpu.clone().into(),
             Column::Memory => self.memory.clone().into(),
             Column::Data => self.data.clone().into(),
@@ -271,6 +312,7 @@ fn by(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match category {
         Column::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        Column::Session => a.session.to_lowercase().cmp(&b.session.to_lowercase()),
         Column::Cpu => b
             .sort_cpu
             .partial_cmp(&a.sort_cpu)

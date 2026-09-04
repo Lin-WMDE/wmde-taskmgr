@@ -11,6 +11,7 @@ column-data = Дані
 column-disk = Диск
 column-threads = Потоки
 column-pid = PID
+column-session = Сеанс
 
 section-applications = Програми
 section-background = Фонові процеси
@@ -32,6 +33,18 @@ rate-b = { $value } Б/с
 rate-kib = { $value } КіБ/с
 rate-mib = { $value } МіБ/с
 rate-gib = { $value } ГіБ/с
+
+# Який це вхід. Рядок вкладки користувачів - один вхід, а не один обліковий запис.
+session-desktop = Робочий стіл
+session-console = Консоль { $tty }
+session-console-plain = Консоль
+session-remote = ssh { $host }
+session-remote-service = { $service } { $host }
+session-remote-plain = ssh
+# Те, що працює поза будь-яким входом: portals, pipewire, systemd --user.
+session-background = Фонові служби
+# Два однакові входи одного облікового запису розводяться вузлом: pts/2 або номер сеансу.
+session-node = { $what } ({ $node })
 
 no-value = -
 
