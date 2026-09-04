@@ -31,6 +31,12 @@ const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 /// arriving, and what runs under them belongs in the account's background row.
 const CLASS_USER: &str = "user";
 
+/// The state logind gives a session whose leader has gone: the person disconnected, and what
+/// they left running keeps the login registered until it exits. A daemon started inside an ssh
+/// session - `gpg-agent`, `ydotoold` - holds one open for as long as it runs, and a page about
+/// the people at the machine must not count it as one.
+const STATE_CLOSING: &str = "closing";
+
 /// One login.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Session {
@@ -126,6 +132,17 @@ pub fn subscription() -> impl Stream<Item = Vec<Session>> {
             return stall().await;
         };
 
+        // A login that ends does not leave: logind moves it to `closing` and keeps it while
+        // something it started is still running. That is a property change and no signal of
+        // the manager, so it is watched by a match rule over every session object at once.
+        let mut restated = match changes(&connection).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::info!("cannot watch logins closing: {err}");
+                cosmic::iced::futures::stream::pending().boxed()
+            }
+        };
+
         // Once before waiting: logind signals what changes, not what is already there.
         if output
             .send(list(&connection, &manager).await)
@@ -140,6 +157,9 @@ pub fn subscription() -> impl Stream<Item = Vec<Session>> {
             let signalled = tokio::select! {
                 signal = arrived.next() => signal.is_some(),
                 signal = left.next() => signal.is_some(),
+                // A property change is not a reason to stop when the stream ends: the two
+                // manager signals still carry the list.
+                signal = restated.next() => signal.is_some() || true,
             };
             if !signalled {
                 return;
@@ -153,6 +173,27 @@ pub fn subscription() -> impl Stream<Item = Vec<Session>> {
             }
         }
     })
+}
+
+/// Property changes of every session object at once, so that a login moving to `closing` is
+/// seen. One match rule for all of them: a rule per session would be added and dropped on
+/// every connection.
+async fn changes(
+    connection: &zbus::Connection,
+) -> zbus::Result<cosmic::iced::futures::stream::BoxStream<'static, zbus::Result<zbus::Message>>> {
+    use cosmic::iced::futures::StreamExt as _;
+
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.DBus.Properties")?
+        .member("PropertiesChanged")?
+        .arg(0, SESSION_IFACE)?
+        .build();
+    Ok(
+        zbus::MessageStream::for_match_rule(rule, connection, Some(4))
+            .await?
+            .boxed(),
+    )
 }
 
 /// Every login logind knows, with the properties the page needs.
@@ -199,6 +240,9 @@ fn read(uid: u32, user: String, props: &HashMap<String, OwnedValue>) -> Option<S
     }
     // Without audit the kernel writes no session id into /proc either, so a login that cannot
     // be named by that number cannot be matched to a single process and is not worth a row.
+    if text(props, "State") == STATE_CLOSING {
+        return None;
+    }
     let audit = number(props, "Audit")?;
     if audit == 0 || audit == u32::MAX {
         return None;
@@ -272,6 +316,22 @@ mod tests {
             ("Type", owned("unspecified")),
         ]);
         assert!(read(1000, "softer".into(), &manager).is_none());
+    }
+
+    /// A daemon left running inside an ssh session - `gpg-agent`, `ydotoold` - keeps the
+    /// login registered for as long as it runs, long after the person disconnected.
+    #[test]
+    fn a_login_whose_person_has_gone_is_not_a_login() {
+        let closing = props(&[
+            ("Class", owned("user")),
+            ("State", owned("closing")),
+            ("Audit", 14u32.into()),
+            ("Type", owned("tty")),
+            ("Remote", true.into()),
+            ("Service", owned("sshd")),
+            ("RemoteHost", owned("172.17.6.2")),
+        ]);
+        assert!(read(0, "root".into(), &closing).is_none());
     }
 
     #[test]
