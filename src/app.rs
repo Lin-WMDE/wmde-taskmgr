@@ -310,16 +310,19 @@ impl App {
 
         let search = widget::text_input::search_input(fl!("search"), &self.search)
             .id(SEARCH.clone())
-            .width(Length::Fill)
+            .width(Length::FillPortion(2))
             .on_input(Message::Search)
             .on_clear(Message::SearchClear);
 
-        let scope = widget::dropdown::multi::dropdown(&self.scopes, Message::Scope);
+        // A third of the bar, and not the width of whatever is picked: the list drops
+        // straight down from the field and can grow no wider than the room left to the edge
+        // of the window. A field that hugged its label would leave the logins to wrap.
+        let scope = widget::dropdown::multi::dropdown(&self.scopes, Message::Scope)
+            .width(Length::FillPortion(1));
 
-        // Fill on the row as well as on the field. A Shrink row resolves a Fill child
+        // Fill on the row as well as on the fields. A Shrink row resolves a Fill child
         // against its own intrinsic width, and the search box would keep the width of its
-        // placeholder. The dropdown is Shrink by default and keeps the width it had; it
-        // simply ends up against the right edge.
+        // placeholder. The two share the bar two to one.
         let bar = widget::row::with_capacity(2)
             .spacing(spacing.space_xs)
             .align_y(cosmic::iced::Alignment::Center)
