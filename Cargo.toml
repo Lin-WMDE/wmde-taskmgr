@@ -72,6 +72,11 @@ iced_wgpu = { path = "../libcosmic/iced/wgpu" }
 iced_widget = { path = "../libcosmic/iced/widget" }
 iced_winit = { path = "../libcosmic/iced/winit" }
 
+# WMDE: redirect the panel config crate to the local wmde-panel fork. wmde-sysmon brings
+# libcosmic's applet feature, and with it cosmic-panel-config by git.
+[patch."https://github.com/pop-os/cosmic-panel"]
+cosmic-panel-config = { path = "../wmde-panel/cosmic-panel-config" }
+
 # WMDE: shared release profile, see .doc/perf.
 #  - panic = "abort" drops .eh_frame and .gcc_except_table; catch_unwind stops catching,
 #    which in this stack only guards SVG parsing in iced's vector backends.
