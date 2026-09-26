@@ -2,8 +2,8 @@
 
 Task manager for WMDE. Reference: the Windows 11 Task Manager, `ref/taskman/` in the WMDE tree.
 
-Written here rather than forked: COSMIC ships no task manager, so this one has no upstream and
-is never merged from anywhere.
+Written here rather than forked, so it has no upstream and is never merged from anywhere. COSMIC
+1.9 ships a system monitor of its own, cosmic-monitor; WMDE does not take it and keeps this one.
 
 Three tabs behind a navigation rail:
 

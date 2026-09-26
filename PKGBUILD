@@ -1,7 +1,8 @@
 # Maintainer: WMDE <https://wmde.fun>
 #
-# Builds our own Lin-WMDE/wmde-taskmgr (branch wmde). No upstream: COSMIC has no task
-# manager, so this one is written here and never merged from anywhere.
+# Builds our own Lin-WMDE/wmde-taskmgr (branch wmde). No upstream: written here and never
+# merged from anywhere. COSMIC 1.9 ships a system monitor of its own, cosmic-monitor; the
+# stack does not take it and keeps this one.
 #
 # The window binds to fun.wmde.Comp.Windows in the compositor to learn which process owns
 # which window; without a new enough wmde-comp the process list still works, only the
