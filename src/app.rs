@@ -387,7 +387,8 @@ impl cosmic::Application for App {
         &mut self.core
     }
 
-    fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+    fn init(mut core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        core.window.title_bar = cosmic::app::TitleBar::Tabs;
         let mut tabs = segmented_button::ModelBuilder::default();
         for (label, page) in [
             (fl!("processes"), Page::Processes),
