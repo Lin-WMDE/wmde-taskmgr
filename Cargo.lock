@@ -6396,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "wmde-taskmgr"
-version = "1.10.1"
+version = "1.10.2"
 dependencies = [
  "i18n-embed",
  "i18n-embed-fl",
