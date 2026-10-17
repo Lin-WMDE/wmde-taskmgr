@@ -513,7 +513,9 @@ impl Performance {
             .push(widget::Space::new().width(Length::Fill));
         let aside = self.aside(self.device);
         if !aside.is_empty() {
-            heading = heading.push(widget::text::body(aside));
+            // Right-aligned so a name long enough to wrap - an older card's seventy characters
+            // from `pci.ids` - still sits against the far edge rather than against the title.
+            heading = heading.push(widget::text::body(aside).align_x(Alignment::End));
         }
 
         // Axis labels, above the plot and not below it: the window on the left, the top of
