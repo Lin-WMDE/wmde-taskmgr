@@ -577,7 +577,11 @@ impl Performance {
             );
         let facts = match self.device {
             Device::Cpu => Some(self.facts_panel()),
-            Device::Gpu(i) => self.gpus.cards().get(i).map(gpu_panel),
+            Device::Gpu(i) => self
+                .gpus
+                .cards()
+                .get(i)
+                .map(|card| gpu_panel(card, self.gpu_name(Device::Gpu(i)))),
             _ => None,
         };
         if let Some(facts) = facts {
@@ -924,13 +928,22 @@ impl Performance {
         }
     }
 
+    /// The card's product name, `NVIDIA GeForce GTX 1660`, or nothing for a card the table
+    /// does not know.
+    fn gpu_model(&self, device: Device) -> Option<String> {
+        self.gpu_name(device)
+            .map(|name| name.model.clone())
+            .filter(|model| !model.is_empty())
+    }
+
     /// The top line of a rail row, and the heading of the page.
     ///
     /// A drive is called by its model, the way the reference calls it: a name off the box the
     /// user bought. A network card has no such name short enough for a rail row - `pci.ids`
     /// spells it out in fifty characters - so it goes by what it is, and the full name sits
-    /// beside the heading where there is room for it. A graphics card does have one: the
-    /// product in brackets, `GeForce GTX 1660`, with the chip it is built on beside it.
+    /// beside the heading where there is room for it. A graphics card goes by what it is, as
+    /// the processor does and as the reference calls it: `pci.ids` names an older card in
+    /// seventy characters, and two cards are told apart by their node.
     fn title(&self, device: Device) -> String {
         match device {
             Device::Cpu => fl!("device-cpu"),
@@ -959,12 +972,7 @@ impl Performance {
                     None => fl!("device-net-ethernet"),
                 }
             }
-            // The product, `NVIDIA GeForce GTX 1660`, and not the chip it is built on.
-            Device::Gpu(_) => self
-                .gpu_name(device)
-                .map(|name| name.model.clone())
-                .filter(|model| !model.is_empty())
-                .unwrap_or_else(|| fl!("device-gpu")),
+            Device::Gpu(_) => fl!("device-gpu"),
         }
     }
 
@@ -1012,7 +1020,7 @@ impl Performance {
                 .interface(self.node(device))
                 .map(|card| card.model.clone())
                 .unwrap_or_default(),
-            Device::Gpu(_) => self.detail(device),
+            Device::Gpu(_) => self.gpu_model(device).unwrap_or_default(),
         }
     }
 
@@ -1057,19 +1065,11 @@ impl Performance {
                     None => node.to_owned(),
                 }
             }
-            // The chip and the node, `TU116 (card0)`; the node alone for a card the table
-            // names without a chip.
-            Device::Gpu(_) => {
-                let node = self.node(device);
-                match self
-                    .gpu_name(device)
-                    .map(|name| name.chip.as_str())
-                    .filter(|chip| !chip.is_empty())
-                {
-                    Some(chip) => fl!("device-node", what = chip, node = node),
-                    None => node.to_owned(),
-                }
-            }
+            // The product, `NVIDIA GeForce GTX 1660`; the node for a card the table does not
+            // know, so the line is never blank.
+            Device::Gpu(_) => self
+                .gpu_model(device)
+                .unwrap_or_else(|| self.node(device).to_owned()),
         }
     }
 
@@ -1112,8 +1112,8 @@ fn gpu_busy(card: Option<&Card>) -> String {
 /// Utilization is always drawn - a dash for a card that publishes none, so the page says
 /// "unknown" in the place the figure would be. Video memory is drawn only for a card that has
 /// its own and reports it; an integrated card shares the machine's, which the memory page
-/// already shows.
-fn gpu_panel(card: &Card) -> Element<'_, Message> {
+/// already shows. The chip is drawn only when `pci.ids` names one.
+fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let pair = |label: String, value: String| {
         widget::column::with_capacity(2)
@@ -1143,11 +1143,19 @@ fn gpu_panel(card: &Card) -> Element<'_, Message> {
         ));
     }
 
-    let mut list = widget::column::with_capacity(2).spacing(spacing.space_xxxs);
+    let mut list = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    if let Some(chip) = name
+        .map(|name| name.chip.as_str())
+        .filter(|c| !c.is_empty())
+    {
+        list = list.push(line(fl!("fact-gpu-chip"), chip.to_owned()));
+    }
     if !card.driver.is_empty() {
         list = list.push(line(fl!("fact-gpu-driver"), card.driver.to_string()));
     }
-    list = list.push(line(fl!("fact-gpu-location"), card.address.to_string()));
+    list = list
+        .push(line(fl!("fact-gpu-node"), card.node.to_string()))
+        .push(line(fl!("fact-gpu-location"), card.address.to_string()));
 
     widget::column::with_capacity(2)
         .spacing(spacing.space_xxs)

@@ -121,7 +121,9 @@ fact-mem-modules = Modules
 
 # Graphics card page, in the column the processor page fills with its facts.
 fact-gpu-memory = Video memory
+fact-gpu-chip = Chip:
 fact-gpu-driver = Driver:
+fact-gpu-node = Node:
 fact-gpu-location = Location:
 
 speed-ghz = { $value } GHz

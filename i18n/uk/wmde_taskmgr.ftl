@@ -115,7 +115,9 @@ fact-mem-channels = Каналів:
 fact-mem-modules = Модулі
 
 fact-gpu-memory = Відеопамʼять
+fact-gpu-chip = Чіп:
 fact-gpu-driver = Драйвер:
+fact-gpu-node = Вузол:
 fact-gpu-location = Розташування:
 
 speed-ghz = { $value } ГГц
