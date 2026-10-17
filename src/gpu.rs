@@ -90,18 +90,23 @@ impl Gpus {
                 continue;
             }
             let card_dir = root.join(name);
-            let device = card_dir.join("device");
-            // A platform device - simpledrm, a firmware framebuffer - has no PCI class.
-            if !read_text(&device.join("class")).is_some_and(|c| c.starts_with(DISPLAY_CLASS)) {
+            let link = card_dir.join("device");
+            let Some(device) = display_function(&link) else {
                 continue;
-            }
-            let Some(address) = link_basename(&device) else {
+            };
+            let Some(address) = device
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+            else {
                 continue;
             };
             if cards.iter().any(|card| *card.address == *address) {
                 continue;
             }
-            let driver = link_basename(&device.join("driver")).unwrap_or_default();
+            // The driver of the device the DRM node hangs off: `virtio_gpu` for a virtio card,
+            // not the `virtio-pci` transport bound to the function above it.
+            let driver = link_basename(&link.join("driver")).unwrap_or_default();
             let source = source_for(&driver, &card_dir, &device);
             cards.push(Card {
                 node: name.into(),
@@ -135,8 +140,8 @@ impl Gpus {
         }
     }
 
-    /// Reads every card's counters. `now` is the tick's own clock reading, so the idle
-    /// residency of an Intel card is measured against the same interval as everything else.
+    /// Reads every card's counters. `now` is taken by the caller, so a test can drive the
+    /// idle-residency arithmetic of an Intel card with a clock of its own.
     pub fn sample(&mut self, now: Instant) {
         let Self { cards, nvml, buf } = self;
         for card in cards.iter_mut() {
@@ -178,6 +183,19 @@ fn card_number(name: &str) -> Option<u32> {
         return None;
     }
     digits.parse().ok()
+}
+
+/// The display-class PCI function behind a card's `device` link: the device itself, or the
+/// function above it for a card that sits on a bus of its own - virtio-gpu hangs its node off
+/// `0000:00:02.0/virtio0`. `None` for a platform device, simpledrm or a firmware framebuffer,
+/// which has no PCI class anywhere.
+fn display_function(link: &Path) -> Option<PathBuf> {
+    let device = std::fs::canonicalize(link).ok()?;
+    [Some(device.as_path()), device.parent()]
+        .into_iter()
+        .flatten()
+        .find(|dir| read_text(&dir.join("class")).is_some_and(|c| c.starts_with(DISPLAY_CLASS)))
+        .map(Path::to_path_buf)
 }
 
 /// Where the driver publishes how busy the card is, if it does.
@@ -393,6 +411,43 @@ mod tests {
         assert_eq!(&*cards[0].address, "0000:00:02.0");
         assert_eq!(cards[0].busy, None);
         assert_eq!(cards[0].memory, None);
+    }
+
+    /// virtio-gpu hangs its node off the virtio bus; the card is the PCI function above it,
+    /// and the driver is the one on the virtio device.
+    #[test]
+    fn a_virtio_card_is_its_pci_function() {
+        let sys = Sysfs::new("virtio");
+        let function = sys.0.join("devices/0000:00:02.0");
+        let virtio = function.join("virtio0");
+        fs::create_dir_all(&virtio).unwrap();
+        fs::write(function.join("class"), "0x030000\n").unwrap();
+        let drivers = sys.0.join("drivers/virtio_gpu");
+        fs::create_dir_all(&drivers).unwrap();
+        symlink(&drivers, virtio.join("driver")).unwrap();
+        let card = sys.drm().join("card0");
+        fs::create_dir_all(&card).unwrap();
+        symlink(&virtio, card.join("device")).unwrap();
+
+        let gpus = Gpus::scan(&sys.drm(), || None);
+        let cards = gpus.cards();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(&*cards[0].address, "0000:00:02.0");
+        assert_eq!(&*cards[0].driver, "virtio_gpu");
+        assert_eq!(cards[0].busy, None);
+    }
+
+    /// A platform framebuffer has no PCI class on itself or above it, and is not a card.
+    #[test]
+    fn a_platform_framebuffer_is_not_a_card() {
+        let sys = Sysfs::new("simpledrm");
+        let platform = sys.0.join("devices/platform/simple-framebuffer.0");
+        fs::create_dir_all(&platform).unwrap();
+        let card = sys.drm().join("card0");
+        fs::create_dir_all(&card).unwrap();
+        symlink(&platform, card.join("device")).unwrap();
+
+        assert!(Gpus::scan(&sys.drm(), || None).cards().is_empty());
     }
 
     #[test]

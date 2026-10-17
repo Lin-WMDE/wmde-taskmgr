@@ -927,9 +927,10 @@ impl Performance {
     /// The top line of a rail row, and the heading of the page.
     ///
     /// A drive is called by its model, the way the reference calls it: a name off the box the
-    /// user bought. A card has no such name short enough for a rail row - `pci.ids` spells it
-    /// out in fifty characters - so it goes by what it is, and the full name sits beside the
-    /// heading where there is room for it.
+    /// user bought. A network card has no such name short enough for a rail row - `pci.ids`
+    /// spells it out in fifty characters - so it goes by what it is, and the full name sits
+    /// beside the heading where there is room for it. A graphics card does have one: the
+    /// product in brackets, `GeForce GTX 1660`, with the chip it is built on beside it.
     fn title(&self, device: Device) -> String {
         match device {
             Device::Cpu => fl!("device-cpu"),
