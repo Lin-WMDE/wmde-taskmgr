@@ -38,6 +38,10 @@ const GRID_COLS: u16 = 6;
 const GRID_ROWS: u16 = 10;
 
 const PLOT_HEIGHT: f32 = 240.0;
+/// A graphics card's memory graphs, under its utilization graph: a third of its height.
+const MEMORY_PLOT_HEIGHT: f32 = PLOT_HEIGHT / 3.0;
+/// Rows of their grid: a quarter of the scale each, at a cell close to the large plot's shape.
+const MEMORY_GRID_ROWS: u16 = 4;
 /// A per-core tile never goes below this, however many cores there are.
 const TILE_MIN_HEIGHT: f32 = 60.0;
 /// Height over width of a per-core tile, measured off `ref/taskman/cpu.png`: 187 by 223.
@@ -187,6 +191,30 @@ fn rings() -> Rings {
     std::array::from_fn(|i| Ring::new(Kind::ALL[i].bands().len(), WINDOW))
 }
 
+/// One graphics card's histories: how busy it is, how full its own memory is, and how much
+/// of the machine's memory it holds. All three are `Kind::Gpu`, so all three take the card's
+/// colour.
+struct GpuHistory {
+    busy: Rings,
+    dedicated: Rings,
+    shared: Rings,
+}
+
+impl GpuHistory {
+    fn new() -> Self {
+        Self {
+            busy: rings(),
+            dedicated: rings(),
+            shared: rings(),
+        }
+    }
+}
+
+/// `used` as a share of `total`, held to the scale.
+fn share(used: u64, total: u64) -> f32 {
+    (used as f64 / total.max(1) as f64).clamp(0.0, 1.0) as f32
+}
+
 /// Pushes this tick onto one history per device, growing the set to match the probe.
 ///
 /// A change of length clears them all: a device is addressed by its place in the list, and a
@@ -245,7 +273,7 @@ pub struct Performance {
     nets: Vec<Rings>,
     /// The graphics cards, found once, and a history for each in the same order.
     gpus: Gpus,
-    gpu_rings: Vec<Rings>,
+    gpu_history: Vec<GpuHistory>,
     /// What each card is called, read from `pci.ids` on the first tick.
     gpu_names: Vec<Option<GpuName>>,
     /// The rail as it stands: the two machine-wide rows, then a row per device.
@@ -290,7 +318,7 @@ impl Performance {
             disks: Vec::new(),
             nets: Vec::new(),
             gpus: Gpus::new(),
-            gpu_rings: Vec::new(),
+            gpu_history: Vec::new(),
             gpu_names: Vec::new(),
             // The two rows that are there before anything has been sampled. The first tick
             // adds the devices.
@@ -351,27 +379,36 @@ impl Performance {
 
         self.gpus.sample(Instant::now());
         let cards = self.gpus.cards();
-        if self.gpu_rings.len() != cards.len() {
-            self.gpu_rings = (0..cards.len()).map(|_| rings()).collect();
+        if self.gpu_history.len() != cards.len() {
+            self.gpu_history = (0..cards.len()).map(|_| GpuHistory::new()).collect();
             let devices: Vec<_> = cards.iter().map(|card| card.device.as_path()).collect();
             self.gpu_names = crate::devices::gpu_names(&devices);
         }
         // A card with nothing to report gets no column at all rather than a zero: an empty
-        // graph says "unknown", a flat line would say "idle".
-        for (set, card) in self.gpu_rings.iter_mut().zip(cards) {
+        // graph says "unknown", a flat line would say "idle". Shared memory without a limit
+        // of its own - an Intel card's - is drawn against the machine's memory.
+        let gpu = Kind::Gpu.index();
+        for (history, card) in self.gpu_history.iter_mut().zip(cards) {
             if let Some(busy) = card.busy {
-                set[Kind::Gpu.index()].push(&[busy]);
+                history.busy[gpu].push(&[busy]);
+            }
+            if let Some((used, total)) = card.memory {
+                history.dedicated[gpu].push(&[share(used, total)]);
+            }
+            if let Some((used, limit)) = card.shared {
+                let limit = limit.unwrap_or(s.mem_total);
+                history.shared[gpu].push(&[share(used, limit)]);
             }
         }
 
-        let devices = rail(self.disks.len(), self.nets.len(), self.gpu_rings.len());
+        let devices = rail(self.disks.len(), self.nets.len(), self.gpu_history.len());
         if devices != self.devices {
             self.devices = devices;
             self.device = valid(
                 self.device,
                 self.disks.len(),
                 self.nets.len(),
-                self.gpu_rings.len(),
+                self.gpu_history.len(),
             );
         }
 
@@ -387,7 +424,9 @@ impl Performance {
             self.cores.clear();
         }
 
-        let needed = 1 + self.devices.len() + self.cores.len();
+        // The large plot, a thumbnail per rail row, a tile per core, and a graphics card's two
+        // memory graphs last.
+        let needed = 1 + self.devices.len() + self.cores.len() + 2;
         while self.caches.len() < needed {
             self.caches.push(canvas::Cache::new());
         }
@@ -556,6 +595,11 @@ impl Performance {
         if self.device == Device::Memory {
             main = main.push(self.memory_panel());
         }
+        if let Device::Gpu(i) = self.device {
+            for element in self.gpu_memory_graphs(i) {
+                main = main.push(element);
+            }
+        }
 
         // The rail scrolls: a machine with six drives has eight rows at seventy-four pixels,
         // which is more than the window has. The spacing keeps the text out from under the
@@ -717,6 +761,55 @@ impl Performance {
             list = list.push(line(module.locator.clone(), what));
         }
         column.push(list).into()
+    }
+
+    /// Under a card's utilization graph: its own memory, then its share of the machine's,
+    /// each with its label and its scale above it, and each only where the driver reports it.
+    /// An Intel card has no memory of its own and NVML does not report shared memory, so
+    /// either may be missing.
+    fn gpu_memory_graphs(&self, i: usize) -> Vec<Element<'_, Message>> {
+        let (Some(card), Some(history)) = (self.gpus.cards().get(i), self.gpu_history.get(i))
+        else {
+            return Vec::new();
+        };
+        let first = 1 + self.devices.len() + self.cores.len();
+        let graphs = [
+            (
+                fl!("fact-gpu-memory"),
+                card.memory.map(|(_, total)| total),
+                &history.dedicated,
+            ),
+            (
+                fl!("fact-gpu-shared"),
+                card.shared
+                    .map(|(_, limit)| limit.unwrap_or(self.last.mem_total)),
+                &history.shared,
+            ),
+        ];
+        let mut out = Vec::with_capacity(4);
+        for (n, (label, top, history)) in graphs.into_iter().enumerate() {
+            let Some(top) = top else {
+                continue;
+            };
+            out.push(
+                widget::row::with_capacity(3)
+                    .push(widget::text::caption(label))
+                    .push(widget::Space::new().width(Length::Fill))
+                    .push(widget::text::caption(size(top)))
+                    .into(),
+            );
+            out.push(self.plot(
+                Kind::Gpu,
+                history,
+                first + n,
+                MEMORY_PLOT_HEIGHT,
+                Style::Curve {
+                    cols: GRID_COLS,
+                    rows: MEMORY_GRID_ROWS,
+                },
+            ));
+        }
+        out
     }
 
     /// The last sample, for whoever needs the machine-wide figures.
@@ -905,7 +998,7 @@ impl Performance {
         match device {
             Device::Disk(i) => self.disks.get(i),
             Device::Network(i) => self.nets.get(i),
-            Device::Gpu(i) => self.gpu_rings.get(i),
+            Device::Gpu(i) => self.gpu_history.get(i).map(|history| &history.busy),
             _ => None,
         }
         .unwrap_or(&self.history)
@@ -1109,12 +1202,14 @@ fn gpu_busy(card: Option<&Card>) -> String {
         .map_or_else(|| fl!("no-value"), percent)
 }
 
-/// The facts panel of a graphics card: what it is doing, then what it is.
+/// The facts panel of a graphics card: what it is doing, what memory it holds, then what it
+/// is.
 ///
 /// Utilization is always drawn - a dash for a card that publishes none, so the page says
-/// "unknown" in the place the figure would be. Video memory is drawn only for a card that has
-/// its own and reports it; an integrated card shares the machine's, which the memory page
-/// already shows. The chip is drawn only when `pci.ids` names one.
+/// "unknown" in the place the figure would be. Every other figure is drawn only when its
+/// source answered: the memory controller and video memory for NVIDIA and AMD, shared memory
+/// for AMD (against its limit) and Intel (alone, as it has none). The chip is drawn only when
+/// `pci.ids` names one.
 fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let pair = |label: String, value: String| {
@@ -1134,15 +1229,26 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
     };
 
     let mut top = vec![pair(fl!("fact-utilization"), gpu_busy(Some(card)))];
+    if let Some(busy) = card.memory_busy {
+        top.push(pair(fl!("fact-gpu-memory-busy"), percent(busy)));
+    }
+    let of = |used: u64, total: u64| {
+        fl!(
+            "fact-mem-committed-value",
+            used = size(used),
+            limit = size(total)
+        )
+    };
+    let mut memory = Vec::with_capacity(2);
     if let Some((used, total)) = card.memory {
-        top.push(pair(
-            fl!("fact-gpu-memory"),
-            fl!(
-                "fact-mem-committed-value",
-                used = size(used),
-                limit = size(total)
-            ),
-        ));
+        memory.push(pair(fl!("fact-gpu-memory"), of(used, total)));
+    }
+    if let Some((used, limit)) = card.shared {
+        let value = match limit {
+            Some(limit) => of(used, limit),
+            None => size(used),
+        };
+        memory.push(pair(fl!("fact-gpu-shared"), value));
     }
 
     let mut list = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
@@ -1159,11 +1265,13 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
         .push(line(fl!("fact-gpu-node"), card.node.to_string()))
         .push(line(fl!("fact-gpu-location"), card.address.to_string()));
 
-    widget::column::with_capacity(2)
+    let mut panel = widget::column::with_capacity(3)
         .spacing(spacing.space_xxs)
-        .push(group(top))
-        .push(list)
-        .into()
+        .push(group(top));
+    if !memory.is_empty() {
+        panel = panel.push(group(memory));
+    }
+    panel.push(list).into()
 }
 
 /// What to call a drive of this kind, or nothing when the machine would not say.
@@ -1383,6 +1491,15 @@ mod tests {
         assert_eq!(valid(Device::Gpu(1), 0, 0, 1), Device::Cpu);
         // The two that are always there are never touched, whatever is plugged in.
         assert_eq!(valid(Device::Memory, 0, 0, 0), Device::Memory);
+    }
+
+    /// A memory graph is a share of its limit, and never leaves the scale: a counter read
+    /// a moment apart from its total can briefly exceed it.
+    #[test]
+    fn memory_is_drawn_as_a_share_of_its_limit() {
+        assert_eq!(share(1 << 30, 4 << 30), 0.25);
+        assert_eq!(share(5, 4), 1.0);
+        assert_eq!(share(0, 0), 0.0);
     }
 
     /// Every device kind is drawn in a colour of its own, the graphics card included.

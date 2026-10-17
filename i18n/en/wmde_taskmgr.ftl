@@ -121,6 +121,8 @@ fact-mem-modules = Modules
 
 # Graphics card page, in the column the processor page fills with its facts.
 fact-gpu-memory = Video memory
+fact-gpu-memory-busy = Memory controller
+fact-gpu-shared = Shared memory
 fact-gpu-chip = Chip:
 fact-gpu-driver = Driver:
 fact-gpu-node = Node:

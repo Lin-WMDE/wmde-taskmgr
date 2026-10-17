@@ -6,22 +6,24 @@
 //! while the window is open. How busy a card is has no common source - each driver publishes
 //! its own, or none:
 //!
-//! | Driver | Utilization | Video memory |
-//! |---|---|---|
-//! | `nvidia` | NVML, `libnvidia-ml.so.1` opened at run time | NVML |
-//! | `amdgpu` | `device/gpu_busy_percent` | `device/mem_info_vram_used`, `mem_info_vram_total` |
-//! | `i915` | idle residency, `gt/gt0/rc6_residency_ms` | none: the memory is the machine's |
-//! | `xe` | idle residency, `device/tile0/gt0/gtidle/idle_residency_ms` | none |
+//! | Driver | Utilization | Video memory | Shared memory |
+//! |---|---|---|---|
+//! | `nvidia` | NVML, `libnvidia-ml.so.1` opened at run time | NVML | none |
+//! | `amdgpu` | `device/gpu_busy_percent` | `device/mem_info_vram_*` | `device/mem_info_gtt_*` |
+//! | `i915` | idle residency, `gt/gt0/rc6_residency_ms` | none | DRM clients' `fdinfo` |
+//! | `xe` | idle residency, `device/tile0/gt0/gtidle/idle_residency_ms` | none | as `i915` |
 //!
-//! Any other card - a virtual one, nouveau - is listed with its name and no reading. Nothing
-//! here needs root or starts a process: `nvidia-smi` would cost a process every tick.
+//! NVML and `amdgpu` also say how busy the memory controller is. Any other card - a virtual
+//! one, nouveau - is listed with its name and no reading. Nothing here needs root or starts a
+//! process: `nvidia-smi` would cost a process every tick.
 
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CString, OsStr, c_char, c_int, c_uint, c_void};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const DRM_DIR: &str = "/sys/class/drm";
+const PROC_DIR: &str = "/proc";
 
 /// PCI class `0x03xxxx`: a display controller.
 const DISPLAY_CLASS: &str = "0x03";
@@ -42,6 +44,12 @@ pub struct Card {
     /// Video memory in use and in all, in bytes. `None` where the card has none of its own
     /// or the driver does not say.
     pub memory: Option<(u64, u64)>,
+    /// Share of the last interval the memory controller was busy, `0.0..=1.0`.
+    pub memory_busy: Option<f32>,
+    /// System memory the card holds, in bytes, and the most it may hold where the driver says.
+    /// `amdgpu` reports both (GTT); for an Intel card it is the sum over the DRM clients this
+    /// user can see, and has no limit but the machine's memory.
+    pub shared: Option<(u64, Option<u64>)>,
     source: Source,
 }
 
@@ -53,6 +61,9 @@ enum Source {
         busy: PathBuf,
         used: PathBuf,
         total: PathBuf,
+        memory_busy: PathBuf,
+        gtt_used: PathBuf,
+        gtt_total: PathBuf,
     },
     /// A cumulative idle counter in milliseconds, and the last reading of it.
     Idle {
@@ -66,6 +77,8 @@ pub struct Gpus {
     nvml: Option<Nvml>,
     /// One read buffer for every counter file, so a tick does not allocate.
     buf: Vec<u8>,
+    /// Where the DRM clients' `fdinfo` is read from: `/proc`, or a test's stand-in for it.
+    proc: PathBuf,
 }
 
 impl Gpus {
@@ -115,6 +128,8 @@ impl Gpus {
                 device,
                 busy: None,
                 memory: None,
+                memory_busy: None,
+                shared: None,
                 source,
             });
         }
@@ -137,28 +152,43 @@ impl Gpus {
             cards,
             nvml,
             buf: Vec::with_capacity(32),
+            proc: PathBuf::from(PROC_DIR),
         }
     }
 
     /// Reads every card's counters. `now` is taken by the caller, so a test can drive the
     /// idle-residency arithmetic of an Intel card with a clock of its own.
     pub fn sample(&mut self, now: Instant) {
-        let Self { cards, nvml, buf } = self;
+        let Self {
+            cards,
+            nvml,
+            buf,
+            proc,
+        } = self;
         for card in cards.iter_mut() {
             match &mut card.source {
                 Source::None => {}
                 Source::Nvml(handle) => {
                     if let Some(nvml) = nvml {
-                        card.busy = nvml.utilization(*handle);
+                        let rates = nvml.utilization(*handle);
+                        card.busy = rates.map(|(gpu, _)| gpu);
+                        card.memory_busy = rates.map(|(_, memory)| memory);
                         card.memory = nvml.memory(*handle);
                     }
                 }
-                Source::Amdgpu { busy, used, total } => {
-                    card.busy = read_u64(busy, buf).map(|percent| percent.min(100) as f32 / 100.0);
-                    card.memory = match (read_u64(used, buf), read_u64(total, buf)) {
-                        (Some(used), Some(total)) if total > 0 => Some((used, total)),
-                        _ => None,
-                    };
+                Source::Amdgpu {
+                    busy,
+                    used,
+                    total,
+                    memory_busy,
+                    gtt_used,
+                    gtt_total,
+                } => {
+                    card.busy = read_percent(busy, buf);
+                    card.memory_busy = read_percent(memory_busy, buf);
+                    card.memory = read_pair(used, total, buf);
+                    card.shared = read_pair(gtt_used, gtt_total, buf)
+                        .map(|(used, total)| (used, Some(total)));
                 }
                 Source::Idle { path, last } => {
                     let idle = read_u64(path, buf);
@@ -173,7 +203,23 @@ impl Gpus {
                 }
             }
         }
+
+        // An Intel card's share of the machine's memory has no counter of its own; it is
+        // what its clients hold. Walked only when there is such a card to ask about.
+        if cards.iter().any(is_intel) {
+            let held = drm_memory(proc, buf);
+            for card in cards.iter_mut().filter(|card| is_intel(card)) {
+                card.shared = held
+                    .iter()
+                    .find(|(pdev, _)| **pdev == *card.address)
+                    .map(|(_, bytes)| (*bytes, None));
+            }
+        }
     }
+}
+
+fn is_intel(card: &Card) -> bool {
+    matches!(&*card.driver, "i915" | "xe")
 }
 
 /// `card0` -> `0`. `None` for a connector (`card0-HDMI-A-1`) or a render node (`renderD128`).
@@ -205,6 +251,9 @@ fn source_for(driver: &str, card_dir: &Path, device: &Path) -> Source {
             busy: device.join("gpu_busy_percent"),
             used: device.join("mem_info_vram_used"),
             total: device.join("mem_info_vram_total"),
+            memory_busy: device.join("mem_busy_percent"),
+            gtt_used: device.join("mem_info_gtt_used"),
+            gtt_total: device.join("mem_info_gtt_total"),
         },
         "i915" => idle_source(card_dir.join("gt/gt0/rc6_residency_ms")),
         "xe" => idle_source(device.join("tile0/gt0/gtidle/idle_residency_ms")),
@@ -236,6 +285,143 @@ fn read_u64(path: &Path, buf: &mut Vec<u8>) -> Option<u64> {
     buf.clear();
     std::fs::File::open(path).ok()?.read_to_end(buf).ok()?;
     std::str::from_utf8(buf).ok()?.trim().parse().ok()
+}
+
+/// A whole-percent counter as a share, `0.0..=1.0`.
+fn read_percent(path: &Path, buf: &mut Vec<u8>) -> Option<f32> {
+    read_u64(path, buf).map(|percent| percent.min(100) as f32 / 100.0)
+}
+
+/// A used and a total counter, kept only when the total is not zero.
+fn read_pair(used: &Path, total: &Path, buf: &mut Vec<u8>) -> Option<(u64, u64)> {
+    match (read_u64(used, buf), read_u64(total, buf)) {
+        (Some(used), Some(total)) if total > 0 => Some((used, total)),
+        _ => None,
+    }
+}
+
+/// What one DRM client's `fdinfo` says about it.
+#[derive(Debug, PartialEq)]
+struct Client {
+    /// `drm-pdev`, the PCI address of the card.
+    pdev: String,
+    /// `drm-client-id`, unique per open of the device; several descriptors may share it.
+    id: u64,
+    /// System memory held, in bytes, with a buffer shared with another client counted at
+    /// half. `None` when the kernel reports no memory regions.
+    memory: Option<u64>,
+}
+
+/// Reads a DRM client's `fdinfo`. `None` for a descriptor that is not a DRM client.
+///
+/// Every region of system memory counts - `system0` and `stolen-system0` on `i915`, `system`
+/// and `gtt` on `xe` - and only memory on the card (`vram*`, `local*`) is left out. A shared
+/// buffer is reported by every client that holds it; it is nearly always two, an application
+/// and the compositor, so each counts half of it.
+fn parse_fdinfo(text: &str) -> Option<Client> {
+    let mut pdev = None;
+    let mut id = None;
+    let (mut resident, mut shared, mut reported) = (0_u64, 0_u64, false);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "drm-pdev" => pdev = Some(value.to_owned()),
+            "drm-client-id" => id = value.parse().ok(),
+            _ => {
+                let (into, region) = if let Some(region) = key.strip_prefix("drm-resident-") {
+                    (&mut resident, region)
+                } else if let Some(region) = key.strip_prefix("drm-shared-") {
+                    (&mut shared, region)
+                } else {
+                    continue;
+                };
+                if region.starts_with("vram") || region.starts_with("local") {
+                    continue;
+                }
+                if let Some(bytes) = parse_size(value) {
+                    *into += bytes;
+                    reported = true;
+                }
+            }
+        }
+    }
+    Some(Client {
+        pdev: pdev?,
+        id: id?,
+        memory: reported.then(|| resident.saturating_sub(shared / 2)),
+    })
+}
+
+/// `60268 KiB`, `1 MiB`, `4096` (bytes) -> bytes.
+fn parse_size(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let number: u64 = parts.next()?.parse().ok()?;
+    let scale = match parts.next() {
+        None => 1,
+        Some("KiB") => 1 << 10,
+        Some("MiB") => 1 << 20,
+        Some("GiB") => 1 << 30,
+        Some(_) => return None,
+    };
+    Some(number.saturating_mul(scale))
+}
+
+/// System memory DRM clients hold, per card address, summed over every process whose
+/// descriptors this user may read.
+///
+/// Only descriptors that point into `/dev/dri/` have their `fdinfo` read; the rest cost one
+/// `readlink`. A client is counted once however many descriptors it has open. A card none of
+/// whose clients reports memory is left out, so it reads as having no source rather than as
+/// holding nothing.
+fn drm_memory(proc: &Path, buf: &mut Vec<u8>) -> Vec<(String, u64)> {
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    let mut held: Vec<(String, u64)> = Vec::new();
+    for process in std::fs::read_dir(proc).into_iter().flatten().flatten() {
+        let pid = process.file_name();
+        if !pid.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let dir = process.path();
+        let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if !target.starts_with("/dev/dri") {
+                continue;
+            }
+            let Some(client) = read_client(&dir, &fd.file_name(), buf) else {
+                continue;
+            };
+            let key = (client.pdev, client.id);
+            if seen.contains(&key) {
+                continue;
+            }
+            let (pdev, _) = &key;
+            if let Some(bytes) = client.memory {
+                match held.iter_mut().find(|(at, _)| at == pdev) {
+                    Some((_, sum)) => *sum += bytes,
+                    None => held.push((pdev.clone(), bytes)),
+                }
+            }
+            seen.push(key);
+        }
+    }
+    held
+}
+
+fn read_client(process: &Path, fd: &OsStr, buf: &mut Vec<u8>) -> Option<Client> {
+    buf.clear();
+    std::fs::File::open(process.join("fdinfo").join(fd))
+        .ok()?
+        .read_to_end(buf)
+        .ok()?;
+    parse_fdinfo(std::str::from_utf8(buf).ok()?)
 }
 
 fn read_text(path: &Path) -> Option<String> {
@@ -324,11 +510,13 @@ impl Nvml {
         (rc == NVML_SUCCESS && !device.is_null()).then_some(device as usize)
     }
 
-    fn utilization(&self, device: usize) -> Option<f32> {
+    /// How busy the card and its memory controller were, as shares, from one call.
+    fn utilization(&self, device: usize) -> Option<(f32, f32)> {
         let mut rates = NvmlUtilization::default();
         // SAFETY: a handle NVML gave out, and a struct of the layout it fills.
         let rc = unsafe { (self.utilization)(device as NvmlDevice, &mut rates) };
-        (rc == NVML_SUCCESS).then(|| rates.gpu.min(100) as f32 / 100.0)
+        let share = |percent: c_uint| percent.min(100) as f32 / 100.0;
+        (rc == NVML_SUCCESS).then(|| (share(rates.gpu), share(rates.memory)))
     }
 
     fn memory(&self, device: usize) -> Option<(u64, u64)> {
@@ -370,6 +558,21 @@ mod tests {
 
         fn drm(&self) -> PathBuf {
             self.0.join("class/drm")
+        }
+
+        /// The stand-in for `/proc`, next to the one for `/sys`.
+        fn proc(&self) -> PathBuf {
+            self.0.join("proc")
+        }
+
+        /// Descriptor `fd` of process `pid`, pointing at `target`, with `fdinfo` beside it.
+        /// The link dangles, as nothing here opens it: only its target is read.
+        fn descriptor(&self, pid: u32, fd: u32, target: &str, fdinfo: &str) {
+            let dir = self.proc().join(pid.to_string());
+            fs::create_dir_all(dir.join("fd")).unwrap();
+            fs::create_dir_all(dir.join("fdinfo")).unwrap();
+            symlink(target, dir.join("fd").join(fd.to_string())).unwrap();
+            fs::write(dir.join("fdinfo").join(fd.to_string()), fdinfo).unwrap();
         }
 
         /// `class/drm/<node>` with a `device` link to `devices/<address>`, which has the
@@ -484,6 +687,7 @@ mod tests {
         fs::write(gt.join("rc6_residency_ms"), "1000\n").unwrap();
 
         let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
         let start = Instant::now();
         gpus.sample(start);
         assert_eq!(gpus.cards()[0].busy, None, "one reading is not an interval");
@@ -516,6 +720,121 @@ mod tests {
         assert_eq!(gpus.cards().len(), 1);
         assert_eq!(&*gpus.cards()[0].driver, "nvidia");
         assert_eq!(gpus.cards()[0].busy, None);
+    }
+
+    #[test]
+    fn amdgpu_reads_memory_controller_and_gtt() {
+        let sys = Sysfs::new("amdgpu-gtt");
+        let device = sys.card("card0", "0000:03:00.0", "0x030000", "amdgpu");
+        fs::write(device.join("gpu_busy_percent"), "5\n").unwrap();
+        fs::write(device.join("mem_busy_percent"), "12\n").unwrap();
+        fs::write(device.join("mem_info_gtt_used"), "268435456\n").unwrap();
+        fs::write(device.join("mem_info_gtt_total"), "8589934592\n").unwrap();
+
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.sample(Instant::now());
+        let card = &gpus.cards()[0];
+        assert_eq!(card.memory_busy, Some(0.12));
+        assert_eq!(card.shared, Some((256 << 20, Some(8 << 30))));
+        // No VRAM counters in the fixture: the card reads as having none, not as empty.
+        assert_eq!(card.memory, None);
+    }
+
+    #[test]
+    fn fdinfo_sizes_come_in_every_unit() {
+        assert_eq!(parse_size("4096"), Some(4096));
+        assert_eq!(parse_size("60268 KiB"), Some(60268 << 10));
+        assert_eq!(parse_size("1 MiB"), Some(1 << 20));
+        assert_eq!(parse_size("2 GiB"), Some(2 << 30));
+        assert_eq!(parse_size("1 TiB"), None);
+        assert_eq!(parse_size("many"), None);
+    }
+
+    /// System regions count, memory on the card does not, and a shared buffer counts half.
+    #[test]
+    fn a_client_holds_its_system_memory() {
+        let client = parse_fdinfo(
+            "pos:\t0\nflags:\t02100002\ndrm-driver:\ti915\ndrm-client-id:\t10\n\
+             drm-pdev:\t0000:00:02.0\ndrm-total-system0:\t4 MiB\n\
+             drm-resident-system0:\t4 MiB\ndrm-shared-system0:\t2 MiB\n\
+             drm-resident-stolen-system0:\t1 MiB\ndrm-resident-vram0:\t1 GiB\n",
+        )
+        .unwrap();
+        assert_eq!(client.pdev, "0000:00:02.0");
+        assert_eq!(client.id, 10);
+        assert_eq!(client.memory, Some((4 + 1 - 1) << 20));
+    }
+
+    #[test]
+    fn a_client_without_regions_reports_no_memory() {
+        let client =
+            parse_fdinfo("drm-driver:\ti915\ndrm-client-id:\t3\ndrm-pdev:\t0000:00:02.0\n")
+                .unwrap();
+        assert_eq!(client.memory, None);
+        // Not a DRM client at all.
+        assert_eq!(parse_fdinfo("pos:\t0\nflags:\t02\nmnt_id:\t25\n"), None);
+    }
+
+    #[test]
+    fn intel_shared_memory_is_the_sum_of_its_clients() {
+        let sys = Sysfs::new("fdinfo");
+        sys.card("card1", "0000:00:02.0", "0x030000", "i915");
+        let ours = |id: u32, mib: u32| {
+            format!(
+                "drm-client-id:\t{id}\ndrm-pdev:\t0000:00:02.0\n\
+                 drm-resident-system0:\t{mib} MiB\ndrm-shared-system0:\t0\n"
+            )
+        };
+        // Two descriptors of one client: counted once.
+        sys.descriptor(100, 3, "/dev/dri/card1", &ours(10, 60));
+        sys.descriptor(100, 4, "/dev/dri/renderD128", &ours(10, 60));
+        sys.descriptor(200, 5, "/dev/dri/renderD128", &ours(11, 4));
+        // Another card's client.
+        sys.descriptor(
+            200,
+            6,
+            "/dev/dri/renderD129",
+            "drm-client-id:\t12\ndrm-pdev:\t0000:01:00.0\ndrm-resident-system0:\t1 GiB\n",
+        );
+        // Not a DRM descriptor: its fdinfo is never read, whatever it says.
+        sys.descriptor(200, 7, "/home/user/file", &ours(13, 1000));
+
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        gpus.sample(Instant::now());
+        assert_eq!(gpus.cards()[0].shared, Some(((60 + 4) << 20, None)));
+    }
+
+    #[test]
+    fn only_an_intel_card_has_its_clients_counted() {
+        let sys = Sysfs::new("fdinfo-other");
+        sys.card("card0", "0000:00:02.0", "0x030000", "vmwgfx");
+        sys.descriptor(
+            100,
+            3,
+            "/dev/dri/card0",
+            "drm-client-id:\t1\ndrm-pdev:\t0000:00:02.0\ndrm-resident-system0:\t8 MiB\n",
+        );
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        gpus.sample(Instant::now());
+        assert_eq!(gpus.cards()[0].shared, None);
+    }
+
+    #[test]
+    fn an_intel_card_without_reporting_clients_has_no_shared_memory() {
+        let sys = Sysfs::new("fdinfo-old");
+        sys.card("card0", "0000:00:02.0", "0x030000", "i915");
+        sys.descriptor(
+            100,
+            3,
+            "/dev/dri/card0",
+            "drm-client-id:\t1\ndrm-pdev:\t0000:00:02.0\n",
+        );
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        gpus.sample(Instant::now());
+        assert_eq!(gpus.cards()[0].shared, None);
     }
 
     #[test]

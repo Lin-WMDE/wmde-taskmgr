@@ -115,6 +115,8 @@ fact-mem-channels = Каналів:
 fact-mem-modules = Модулі
 
 fact-gpu-memory = Відеопамʼять
+fact-gpu-memory-busy = Контролер памʼяті
+fact-gpu-shared = Спільна памʼять
 fact-gpu-chip = Чіп:
 fact-gpu-driver = Драйвер:
 fact-gpu-node = Вузол:
