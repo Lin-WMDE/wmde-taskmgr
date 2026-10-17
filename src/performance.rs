@@ -8,6 +8,7 @@
 //! per-core switch lives in the graph's context menu, as it does in the reference.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use cosmic::iced::widget::canvas;
 use cosmic::iced::widget::text::Wrapping;
@@ -19,9 +20,10 @@ use wmde_sysmon::probe::{DeviceRate, Probe, Sample, Sources};
 
 use crate::memory::Report;
 
-use crate::devices::{Catalog, DiskKind, LinkKind};
+use crate::devices::{Catalog, DiskKind, GpuName, LinkKind};
 use crate::facts::{Facts, Live};
 use crate::fl;
+use crate::gpu::{Card, Gpus};
 
 /// Seconds of history, which is what the reference shows and labels.
 const WINDOW: usize = 60;
@@ -79,7 +81,8 @@ fn tile_columns(n: usize) -> usize {
 /// The processor and the memory are the machine; a disk and a card are one of however many
 /// the machine has, and carry their place in the probe's list. That list is sorted by name
 /// and only changes when hardware does, so the number is stable between rescans - and
-/// [`valid`] catches the rescan where it is not.
+/// [`valid`] catches the rescan where it is not. A graphics card carries its place in
+/// [`Gpus`], which is read once and never changes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Device {
     #[default]
@@ -87,6 +90,7 @@ pub enum Device {
     Memory,
     Disk(usize),
     Network(usize),
+    Gpu(usize),
 }
 
 impl Device {
@@ -96,26 +100,30 @@ impl Device {
             Self::Memory => Kind::Memory,
             Self::Disk(_) => Kind::Disk,
             Self::Network(_) => Kind::Network,
+            Self::Gpu(_) => Kind::Gpu,
         }
     }
 
     /// The top of the scale, where the scale has a top worth naming.
     ///
-    /// Processor and memory are drawn against the whole machine and stop at a hundred per
-    /// cent. Disk and network are drawn against whatever the busiest moment of the window
-    /// was, so there is no fixed ceiling to label and none is invented.
+    /// Processor, memory and graphics card are drawn as a share of the whole and stop at a
+    /// hundred per cent. Disk and network are drawn against whatever the busiest moment of
+    /// the window was, so there is no fixed ceiling to label and none is invented.
     fn scale_top(self) -> Option<String> {
-        matches!(self, Self::Cpu | Self::Memory).then(|| percent(1.0))
+        matches!(self, Self::Cpu | Self::Memory | Self::Gpu(_)).then(|| percent(1.0))
     }
 }
 
-/// The rail for a machine with this many disks and cards.
-fn rail(disks: usize, nets: usize) -> Vec<Device> {
-    let mut out = Vec::with_capacity(2 + disks + nets);
+/// The rail for a machine with this many disks, network cards and graphics cards.
+///
+/// Graphics cards come last, where the reference puts them.
+fn rail(disks: usize, nets: usize, gpus: usize) -> Vec<Device> {
+    let mut out = Vec::with_capacity(2 + disks + nets + gpus);
     out.push(Device::Cpu);
     out.push(Device::Memory);
     out.extend((0..disks).map(Device::Disk));
     out.extend((0..nets).map(Device::Network));
+    out.extend((0..gpus).map(Device::Gpu));
     out
 }
 
@@ -137,10 +145,11 @@ fn elide(text: &str, chars: usize) -> String {
 /// A stick pulled out or a cable unplugged shortens the list under the selection, and the
 /// numbers of everything after it shift by one. Rather than follow a device that may not be
 /// back, the page falls to the processor - the one row that is always there.
-const fn valid(device: Device, disks: usize, nets: usize) -> Device {
+const fn valid(device: Device, disks: usize, nets: usize, gpus: usize) -> Device {
     match device {
         Device::Disk(i) if i >= disks => Device::Cpu,
         Device::Network(i) if i >= nets => Device::Cpu,
+        Device::Gpu(i) if i >= gpus => Device::Cpu,
         other => other,
     }
 }
@@ -206,7 +215,9 @@ fn push_devices(sets: &mut Vec<Rings>, kind: Kind, meters: &[DeviceRate]) {
 ///
 /// The colour is of the kind and not of the device: every disk is drawn green and every card
 /// red, however many there are. The reference does the same, and a palette of four roles has
-/// no fifth green to give the second drive anyway.
+/// no second green to give the second drive anyway. The graphics card is the fifth kind and
+/// has no role of its own; it takes `accent_purple`, the one named colour of the palette the
+/// four roles leave free.
 fn device_colors() -> Colors {
     let theme = cosmic::theme::active();
     let palette = theme.cosmic();
@@ -216,6 +227,7 @@ fn device_colors() -> Colors {
         (Kind::Memory, palette.warning_color()),
         (Kind::Disk, palette.success_color()),
         (Kind::Network, palette.destructive_color()),
+        (Kind::Gpu, palette.palette.accent_purple),
     ] {
         colors.bands[kind.bands()[0] as usize] = Some(Color::from(color));
     }
@@ -231,6 +243,11 @@ pub struct Performance {
     /// One set per disk and one per network card, in the probe's order.
     disks: Vec<Rings>,
     nets: Vec<Rings>,
+    /// The graphics cards, found once, and a history for each in the same order.
+    gpus: Gpus,
+    gpu_rings: Vec<Rings>,
+    /// What each card is called, read from `pci.ids` on the first tick.
+    gpu_names: Vec<Option<GpuName>>,
     /// The rail as it stands: the two machine-wide rows, then a row per device.
     devices: Vec<Device>,
     /// What those disks and cards are. Read once each, when they first appear.
@@ -272,9 +289,12 @@ impl Performance {
             cores: Vec::new(),
             disks: Vec::new(),
             nets: Vec::new(),
+            gpus: Gpus::new(),
+            gpu_rings: Vec::new(),
+            gpu_names: Vec::new(),
             // The two rows that are there before anything has been sampled. The first tick
             // adds the devices.
-            devices: rail(0, 0),
+            devices: rail(0, 0, 0),
             catalog: Catalog::default(),
             caches: (0..=2).map(|_| canvas::Cache::new()).collect(),
             colors: device_colors(),
@@ -329,10 +349,30 @@ impl Performance {
         push_devices(&mut self.disks, Kind::Disk, self.probe.disks());
         push_devices(&mut self.nets, Kind::Network, self.probe.nets());
 
-        let devices = rail(self.disks.len(), self.nets.len());
+        self.gpus.sample(Instant::now());
+        let cards = self.gpus.cards();
+        if self.gpu_rings.len() != cards.len() {
+            self.gpu_rings = (0..cards.len()).map(|_| rings()).collect();
+            let devices: Vec<_> = cards.iter().map(|card| card.device.as_path()).collect();
+            self.gpu_names = crate::devices::gpu_names(&devices);
+        }
+        // A card with nothing to report gets no column at all rather than a zero: an empty
+        // graph says "unknown", a flat line would say "idle".
+        for (set, card) in self.gpu_rings.iter_mut().zip(cards) {
+            if let Some(busy) = card.busy {
+                set[Kind::Gpu.index()].push(&[busy]);
+            }
+        }
+
+        let devices = rail(self.disks.len(), self.nets.len(), self.gpu_rings.len());
         if devices != self.devices {
             self.devices = devices;
-            self.device = valid(self.device, self.disks.len(), self.nets.len());
+            self.device = valid(
+                self.device,
+                self.disks.len(),
+                self.nets.len(),
+                self.gpu_rings.len(),
+            );
         }
 
         if self.per_core {
@@ -535,9 +575,14 @@ impl Performance {
                     .height(Length::Fill)
                     .padding(spacing.space_s),
             );
-        if self.device == Device::Cpu {
+        let facts = match self.device {
+            Device::Cpu => Some(self.facts_panel()),
+            Device::Gpu(i) => self.gpus.cards().get(i).map(gpu_panel),
+            _ => None,
+        };
+        if let Some(facts) = facts {
             row = row.push(
-                widget::container(self.facts_panel())
+                widget::container(facts)
                     .width(Length::Fixed(FACTS_WIDTH))
                     .padding(spacing.space_s),
             );
@@ -854,6 +899,7 @@ impl Performance {
         match device {
             Device::Disk(i) => self.disks.get(i),
             Device::Network(i) => self.nets.get(i),
+            Device::Gpu(i) => self.gpu_rings.get(i),
             _ => None,
         }
         .unwrap_or(&self.history)
@@ -862,11 +908,20 @@ impl Performance {
     /// The kernel's name for a device, which is the key to everything else about it.
     fn node(&self, device: Device) -> &str {
         match device {
-            Device::Disk(i) => self.probe.disks().get(i),
-            Device::Network(i) => self.probe.nets().get(i),
+            Device::Disk(i) => self.probe.disks().get(i).map(|meter| &*meter.name),
+            Device::Network(i) => self.probe.nets().get(i).map(|meter| &*meter.name),
+            Device::Gpu(i) => self.gpus.cards().get(i).map(|card| &*card.node),
             _ => None,
         }
-        .map_or("", |meter| &meter.name)
+        .unwrap_or("")
+    }
+
+    /// What `pci.ids` calls a graphics card, if it knows the card.
+    fn gpu_name(&self, device: Device) -> Option<&GpuName> {
+        match device {
+            Device::Gpu(i) => self.gpu_names.get(i)?.as_ref(),
+            _ => None,
+        }
     }
 
     /// The top line of a rail row, and the heading of the page.
@@ -903,6 +958,12 @@ impl Performance {
                     None => fl!("device-net-ethernet"),
                 }
             }
+            // The product, `NVIDIA GeForce GTX 1660`, and not the chip it is built on.
+            Device::Gpu(_) => self
+                .gpu_name(device)
+                .map(|name| name.model.clone())
+                .filter(|model| !model.is_empty())
+                .unwrap_or_else(|| fl!("device-gpu")),
         }
     }
 
@@ -950,6 +1011,7 @@ impl Performance {
                 .interface(self.node(device))
                 .map(|card| card.model.clone())
                 .unwrap_or_default(),
+            Device::Gpu(_) => self.detail(device),
         }
     }
 
@@ -994,6 +1056,19 @@ impl Performance {
                     None => node.to_owned(),
                 }
             }
+            // The chip and the node, `TU116 (card0)`; the node alone for a card the table
+            // names without a chip.
+            Device::Gpu(_) => {
+                let node = self.node(device);
+                match self
+                    .gpu_name(device)
+                    .map(|name| name.chip.as_str())
+                    .filter(|chip| !chip.is_empty())
+                {
+                    Some(chip) => fl!("device-node", what = chip, node = node),
+                    None => node.to_owned(),
+                }
+            }
         }
     }
 
@@ -1020,8 +1095,64 @@ impl Performance {
                 let lanes = meter.map_or([0.0; 2], |meter| meter.rate);
                 fl!("summary-net-rate", rx = rate(lanes[0]), tx = rate(lanes[1]))
             }
+            Device::Gpu(i) => gpu_busy(self.gpus.cards().get(i)),
         }
     }
+}
+
+/// How busy a card is, or the dash for a card whose driver does not say.
+fn gpu_busy(card: Option<&Card>) -> String {
+    card.and_then(|card| card.busy)
+        .map_or_else(|| fl!("no-value"), percent)
+}
+
+/// The facts panel of a graphics card: what it is doing, then what it is.
+///
+/// Utilization is always drawn - a dash for a card that publishes none, so the page says
+/// "unknown" in the place the figure would be. Video memory is drawn only for a card that has
+/// its own and reports it; an integrated card shares the machine's, which the memory page
+/// already shows.
+fn gpu_panel(card: &Card) -> Element<'_, Message> {
+    let spacing = cosmic::theme::spacing();
+    let pair = |label: String, value: String| {
+        widget::column::with_capacity(2)
+            .push(widget::text::caption(label).wrapping(Wrapping::None))
+            .push(widget::text::heading(value).wrapping(Wrapping::None))
+            .apply(Element::from)
+    };
+    let line = |label: String, value: String| {
+        widget::row::with_capacity(2)
+            .push(
+                widget::text::caption(label)
+                    .wrapping(Wrapping::None)
+                    .width(Length::Fixed(FACT_KEY_WIDTH)),
+            )
+            .push(widget::text::caption(value).wrapping(Wrapping::None))
+    };
+
+    let mut top = vec![pair(fl!("fact-utilization"), gpu_busy(Some(card)))];
+    if let Some((used, total)) = card.memory {
+        top.push(pair(
+            fl!("fact-gpu-memory"),
+            fl!(
+                "fact-mem-committed-value",
+                used = size(used),
+                limit = size(total)
+            ),
+        ));
+    }
+
+    let mut list = widget::column::with_capacity(2).spacing(spacing.space_xxxs);
+    if !card.driver.is_empty() {
+        list = list.push(line(fl!("fact-gpu-driver"), card.driver.to_string()));
+    }
+    list = list.push(line(fl!("fact-gpu-location"), card.address.to_string()));
+
+    widget::column::with_capacity(2)
+        .spacing(spacing.space_xxs)
+        .push(group(top))
+        .push(list)
+        .into()
 }
 
 /// What to call a drive of this kind, or nothing when the machine would not say.
@@ -1203,27 +1334,30 @@ mod tests {
         assert!((149.0 * TILE_ASPECT - 124.0).abs() < 2.0);
     }
 
-    /// Only the two devices drawn against a fixed ceiling name one.
+    /// Only the devices drawn against a fixed ceiling name one.
     #[test]
     fn a_scale_is_labelled_only_where_it_has_a_top() {
         assert!(Device::Cpu.scale_top().is_some());
         assert!(Device::Memory.scale_top().is_some());
+        assert!(Device::Gpu(0).scale_top().is_some());
         assert!(Device::Disk(0).scale_top().is_none());
         assert!(Device::Network(3).scale_top().is_none());
     }
 
-    /// The two machine-wide rows first, then a row per device, in the probe's order.
+    /// The two machine-wide rows first, then a row per device in the probe's order, and the
+    /// graphics cards last.
     #[test]
     fn the_rail_is_the_machine_then_its_devices() {
-        assert_eq!(rail(0, 0), [Device::Cpu, Device::Memory]);
+        assert_eq!(rail(0, 0, 0), [Device::Cpu, Device::Memory]);
         assert_eq!(
-            rail(2, 1),
+            rail(2, 1, 1),
             [
                 Device::Cpu,
                 Device::Memory,
                 Device::Disk(0),
                 Device::Disk(1),
                 Device::Network(0),
+                Device::Gpu(0),
             ]
         );
     }
@@ -1231,11 +1365,35 @@ mod tests {
     /// A device that went away does not leave the page pointing past the end of the list.
     #[test]
     fn a_selection_never_outlives_its_device() {
-        assert_eq!(valid(Device::Disk(1), 2, 1), Device::Disk(1));
-        assert_eq!(valid(Device::Disk(1), 1, 1), Device::Cpu);
-        assert_eq!(valid(Device::Network(0), 1, 0), Device::Cpu);
+        assert_eq!(valid(Device::Disk(1), 2, 1, 0), Device::Disk(1));
+        assert_eq!(valid(Device::Disk(1), 1, 1, 0), Device::Cpu);
+        assert_eq!(valid(Device::Network(0), 1, 0, 0), Device::Cpu);
+        assert_eq!(valid(Device::Gpu(0), 0, 0, 1), Device::Gpu(0));
+        assert_eq!(valid(Device::Gpu(1), 0, 0, 1), Device::Cpu);
         // The two that are always there are never touched, whatever is plugged in.
-        assert_eq!(valid(Device::Memory, 0, 0), Device::Memory);
+        assert_eq!(valid(Device::Memory, 0, 0, 0), Device::Memory);
+    }
+
+    /// Every device kind is drawn in a colour of its own, the graphics card included.
+    #[test]
+    fn every_device_kind_has_its_own_colour() {
+        let colors = device_colors();
+        let kinds = [
+            Kind::Cpu,
+            Kind::Memory,
+            Kind::Disk,
+            Kind::Network,
+            Kind::Gpu,
+        ];
+        let picked: Vec<Color> = kinds
+            .iter()
+            .map(|kind| colors.bands[kind.bands()[0] as usize].expect("set per device"))
+            .collect();
+        for (i, a) in picked.iter().enumerate() {
+            for b in &picked[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     /// A name that fits is left alone; one that does not ends in an ellipsis and never

@@ -185,20 +185,75 @@ fn read_interface(name: &str, pci: Option<(String, String)>) -> Interface {
 /// - a USB adapter publishes `idVendor` instead - or absent from the table.
 fn pci_models(names: &[&str]) -> Vec<Option<(String, String)>> {
     let wanted: Vec<Option<(String, String)>> = names.iter().map(|name| pci_ids(name)).collect();
+    pci_names(&wanted)
+}
+
+/// The table read once for every id pair asked about; `None` for a pair it does not hold and
+/// for all of them when the machine has no table.
+fn pci_names(wanted: &[Option<(String, String)>]) -> Vec<Option<(String, String)>> {
     if wanted.iter().all(Option::is_none) {
-        return vec![None; names.len()];
+        return vec![None; wanted.len()];
     }
     match std::fs::read_to_string(PCI_IDS) {
-        Ok(table) => lookup(&table, &wanted),
+        Ok(table) => lookup(&table, wanted),
         Err(err) => {
             tracing::info!(
                 path = PCI_IDS,
                 ?err,
                 "no pci name table; using driver names"
             );
-            vec![None; names.len()]
+            vec![None; wanted.len()]
         }
     }
+}
+
+/// What a graphics card is called.
+///
+/// The table names a card by its chip and, in brackets, by the product: `TU116 [GeForce GTX
+/// 1660]`, `Navi 23 [Radeon RX 6600/6600 XT/6600M]`. The product is what the owner knows the
+/// card by and goes in the model; the chip is kept apart for the page heading.
+pub struct GpuName {
+    /// `NVIDIA GeForce GTX 1660`.
+    pub model: String,
+    /// `TU116`; empty when the table gives no bracketed product.
+    pub chip: String,
+}
+
+/// Names for these cards, by their device node in sysfs, in the order given. `None` where the
+/// table or the ids are missing; the caller names the card by its driver then.
+pub fn gpu_names(devices: &[&Path]) -> Vec<Option<GpuName>> {
+    let wanted: Vec<Option<(String, String)>> =
+        devices.iter().map(|device| pci_ids_at(device)).collect();
+    pci_names(&wanted)
+        .into_iter()
+        .map(|found| found.map(|(vendor, device)| gpu_name(&vendor, &device)))
+        .collect()
+}
+
+/// `NVIDIA` + `TU116 [GeForce GTX 1660]` -> `NVIDIA GeForce GTX 1660`, chip `TU116`.
+///
+/// AMD is listed as `Advanced Micro Devices, Inc. [AMD/ATI]`, and no legal suffix trims that:
+/// a bracket in the vendor carries the name people use, and of `AMD/ATI` the first half.
+fn gpu_name(vendor: &str, device: &str) -> GpuName {
+    let vendor = match bracketed(vendor) {
+        Some((_, inside)) => inside.split('/').next().unwrap_or(inside).trim(),
+        None => vendor,
+    };
+    let (chip, product) = match bracketed(device) {
+        Some((before, inside)) => (before, inside),
+        None => ("", device),
+    };
+    GpuName {
+        model: format!("{vendor} {product}"),
+        chip: chip.to_owned(),
+    }
+}
+
+/// `TU116 [GeForce GTX 1660]` -> `("TU116", "GeForce GTX 1660")`.
+fn bracketed(text: &str) -> Option<(&str, &str)> {
+    let open = text.find('[')?;
+    let close = text[open..].find(']')? + open;
+    Some((text[..open].trim(), text[open + 1..close].trim()))
 }
 
 /// The walk itself, over a table handed in. Split from the reading so that the shape of the
@@ -241,7 +296,11 @@ fn lookup(table: &str, wanted: &[Option<(String, String)>]) -> Vec<Option<(Strin
 
 /// The `0x8086` and `0x100e` of a card, as pci.ids spells them: four lowercase hex digits.
 fn pci_ids(name: &str) -> Option<(String, String)> {
-    let path = Path::new(NET_DIR).join(name).join("device");
+    pci_ids_at(&Path::new(NET_DIR).join(name).join("device"))
+}
+
+/// The same pair for any device node in sysfs.
+fn pci_ids_at(path: &Path) -> Option<(String, String)> {
     let id = |file: &str| {
         read_trimmed(&path.join(file))
             .and_then(|text| u16::from_str_radix(text.trim_start_matches("0x"), 16).ok())
@@ -440,5 +499,43 @@ C 03  Display controller
             Some("Realtek RTL8111/8168/8411 PCI Express Gigabit Ethernet Controller")
         );
         assert_eq!(found[2], None, "a device the table does not list");
+    }
+}
+
+#[cfg(test)]
+mod gpu_name_tests {
+    use super::*;
+
+    #[test]
+    fn product_in_brackets_is_the_model() {
+        let name = gpu_name("NVIDIA", "TU116 [GeForce GTX 1660]");
+        assert_eq!(name.model, "NVIDIA GeForce GTX 1660");
+        assert_eq!(name.chip, "TU116");
+    }
+
+    #[test]
+    fn amd_is_named_by_its_bracket() {
+        let name = gpu_name(
+            "Advanced Micro Devices, Inc. [AMD/ATI]",
+            "Navi 23 [Radeon RX 6600/6600 XT/6600M]",
+        );
+        assert_eq!(name.model, "AMD Radeon RX 6600/6600 XT/6600M");
+        assert_eq!(name.chip, "Navi 23");
+    }
+
+    #[test]
+    fn a_card_without_a_product_keeps_its_name() {
+        let name = gpu_name("VMware", "SVGA II Adapter");
+        assert_eq!(name.model, "VMware SVGA II Adapter");
+        assert_eq!(name.chip, "");
+    }
+
+    #[test]
+    fn the_table_is_walked_for_cards_too() {
+        let table = "10de  NVIDIA Corporation\n\t2184  TU116 [GeForce GTX 1660]\n";
+        let wanted = [Some(("10de".to_owned(), "2184".to_owned()))];
+        let found = lookup(table, &wanted);
+        let (vendor, device) = found[0].clone().unwrap();
+        assert_eq!(gpu_name(&vendor, &device).model, "NVIDIA GeForce GTX 1660");
     }
 }

@@ -3,6 +3,7 @@
 mod app;
 mod devices;
 mod facts;
+mod gpu;
 mod group;
 mod localize;
 mod memory;

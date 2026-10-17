@@ -6401,6 +6401,7 @@ dependencies = [
  "i18n-embed",
  "i18n-embed-fl",
  "libcosmic",
+ "libloading",
  "ron 0.12.2",
  "rust-embed",
  "rustix 1.1.5",

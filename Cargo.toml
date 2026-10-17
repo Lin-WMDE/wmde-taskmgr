@@ -8,6 +8,8 @@ license = "GPL-3.0-only"
 [dependencies]
 # Sending a signal to another process. std has no kill, and rustix is already in the graph.
 rustix = { version = "1.1", features = ["process"] }
+# NVML, opened at run time for NVIDIA cards (src/gpu.rs); already in the graph through wgpu-hal.
+libloading = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zbus = { version = "5.15.0", default-features = false, features = ["tokio"] }

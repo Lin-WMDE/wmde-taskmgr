@@ -56,6 +56,7 @@ device-disk-nvme = NVMe
 device-disk-ssd = SSD
 device-disk-hdd = HDD
 device-disk-removable = Removable
+device-gpu = GPU
 # What a device is, and under which name the kernel knows it.
 device-node = { $what } ({ $node })
 device-disk-node = { $node }, { $size }
@@ -117,5 +118,10 @@ fact-mem-kind = Type:
 fact-mem-form-factor = Form factor:
 fact-mem-channels = Channels:
 fact-mem-modules = Modules
+
+# Graphics card page, in the column the processor page fills with its facts.
+fact-gpu-memory = Video memory
+fact-gpu-driver = Driver:
+fact-gpu-location = Location:
 
 speed-ghz = { $value } GHz

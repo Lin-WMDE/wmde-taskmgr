@@ -56,6 +56,7 @@ device-disk-nvme = NVMe
 device-disk-ssd = SSD
 device-disk-hdd = HDD
 device-disk-removable = Змінний
+device-gpu = Відеокарта
 device-node = { $what } ({ $node })
 device-disk-node = { $node }, { $size }
 link-mbit = { $value } Мбіт/с
@@ -112,5 +113,9 @@ fact-mem-kind = Тип:
 fact-mem-form-factor = Форм-фактор:
 fact-mem-channels = Каналів:
 fact-mem-modules = Модулі
+
+fact-gpu-memory = Відеопамʼять
+fact-gpu-driver = Драйвер:
+fact-gpu-location = Розташування:
 
 speed-ghz = { $value } ГГц
