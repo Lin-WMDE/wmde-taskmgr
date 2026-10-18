@@ -7,6 +7,7 @@ mod gpu;
 mod group;
 mod localize;
 mod memory;
+mod net;
 mod performance;
 mod probe;
 mod processes;
@@ -14,6 +15,7 @@ mod sessions;
 mod single;
 mod tabs;
 mod users;
+mod wifi;
 mod windows;
 
 fn main() -> cosmic::iced::Result {

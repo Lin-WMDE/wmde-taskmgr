@@ -20,6 +20,7 @@ use crate::probe::Probe;
 use crate::processes::{Column, Row};
 use crate::sessions::{self, Session};
 use crate::users::{self, Names, Range, Whose};
+use crate::wifi::{self, WifiInfo};
 use crate::windows::{self, Event, Window};
 
 /// How often the list is rebuilt. The reference calls this speed "normal", and a release
@@ -106,6 +107,8 @@ pub enum Message {
     },
     DismissError,
     Performance(performance::Message),
+    /// What NetworkManager said about the wireless card on screen.
+    Wifi(String, Option<WifiInfo>),
 }
 
 /// What a selection points at, in terms that outlive a rebuild of the model.
@@ -168,6 +171,10 @@ pub struct App {
     /// Who is logged in. Empty until logind answers, and empty for good on a machine that has
     /// no logind - the users page then folds by account, the way it did before.
     sessions: Vec<Session>,
+    /// A NetworkManager query is out: a slow bus must not stack one up every tick.
+    wifi_pending: bool,
+    /// Wi-Fi is asked about every other tick; the signal does not move faster than that.
+    wifi_tick: bool,
 }
 
 impl App {
@@ -430,6 +437,8 @@ impl cosmic::Application for App {
             user_range: Range::load(),
             users: table::Model::new(Column::USERS.to_vec()),
             sessions: Vec::new(),
+            wifi_pending: false,
+            wifi_tick: false,
         };
         // The first walk has nothing to take a delta against, so every rate reads zero until
         // the second one a second later. Taking it here means the window is not empty when
@@ -477,6 +486,23 @@ impl cosmic::Application for App {
                     self.probe.processes().map(|p| p.threads).sum(),
                 );
                 self.performance.tick();
+
+                // The wireless card on screen, every other tick, off the update thread.
+                self.wifi_tick = !self.wifi_tick;
+                if let Some(iface) = self.performance.wireless()
+                    && self.wifi_tick
+                    && !self.wifi_pending
+                {
+                    self.wifi_pending = true;
+                    return cosmic::task::future(async move {
+                        let info = wifi::query(iface.clone()).await;
+                        Message::Wifi(iface, info)
+                    });
+                }
+            }
+            Message::Wifi(iface, info) => {
+                self.wifi_pending = false;
+                self.performance.set_wifi(iface, info);
             }
             // Kept, not used: the flat list needs nothing from it, and the folding in
             // `group` needs all of it the moment it is wired back up.
@@ -555,7 +581,7 @@ impl cosmic::Application for App {
             Message::DismissError => self.error = None,
             Message::Performance(message) => {
                 match message {
-                    performance::Message::Select(device) => self.performance.device = device,
+                    performance::Message::Select(device) => self.performance.select(device),
                     performance::Message::PerCore(on) => self.performance.per_core = on,
                 }
                 // The plots are cached by size, and every large plot is the same size, so

@@ -131,4 +131,33 @@ fact-gpu-driver = Driver:
 fact-gpu-node = Node:
 fact-gpu-location = Location:
 
+# Network card page, in the column the processor page fills with its facts. Every pair is
+# received first, then sent, as in the rail.
+net-receive = Receive
+net-send = Send
+net-received = Received
+net-sent = Sent
+net-signal = Signal
+net-pair = { $rx } / { $tx }
+net-band = { $value } GHz
+net-speed-duplex = { $speed }, { $duplex }
+net-duplex-full = full duplex
+net-duplex-half = half duplex
+fact-net-state = State:
+fact-net-disconnected = Disconnected
+fact-net-type = Connection type:
+fact-net-ssid = SSID:
+fact-net-band = Band:
+fact-net-speed = Speed:
+fact-net-mac = MAC address:
+fact-net-mtu = MTU:
+fact-net-driver = Driver:
+fact-net-interface = Interface:
+fact-net-packets = Packets:
+fact-net-errors = Errors:
+fact-net-dropped = Dropped:
+fact-net-ipv4 = IPv4 address
+fact-net-ipv6 = IPv6 address
+fact-net-gateway = Default gateway
+
 speed-ghz = { $value } GHz

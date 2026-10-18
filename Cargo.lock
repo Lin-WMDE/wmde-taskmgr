@@ -6400,6 +6400,7 @@ version = "1.10.2"
 dependencies = [
  "i18n-embed",
  "i18n-embed-fl",
+ "libc",
  "libcosmic",
  "libloading",
  "ron 0.12.2",

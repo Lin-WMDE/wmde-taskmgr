@@ -12,10 +12,10 @@ use std::time::Instant;
 
 use cosmic::iced::widget::canvas;
 use cosmic::iced::widget::text::Wrapping;
-use cosmic::iced::{Alignment, Color, Length};
+use cosmic::iced::{Alignment, Color, Length, Point, Rectangle, mouse};
 use cosmic::prelude::*;
 use cosmic::widget;
-use wmde_sysmon::graph::{Colors, Kind, Metrics, Ring, Strip, Style};
+use wmde_sysmon::graph::{Colors, Kind, LINE_DASH, Metrics, Ring, Strip, Style};
 use wmde_sysmon::probe::{DeviceRate, Probe, Sample, Sources};
 
 use crate::memory::Report;
@@ -24,6 +24,8 @@ use crate::devices::{Catalog, DiskKind, GpuName, LinkKind};
 use crate::facts::{Facts, Live};
 use crate::fl;
 use crate::gpu::{Card, Gpus};
+use crate::net::{Duplex, NetFacts};
+use crate::wifi::{Band as WifiBand, WifiInfo};
 
 /// Seconds of history, which is what the reference shows and labels.
 const WINDOW: usize = 60;
@@ -317,6 +319,11 @@ pub struct Performance {
     gpu_history: Vec<GpuHistory>,
     /// What each card is called, read from `pci.ids` on the first tick.
     gpu_names: Vec<Option<GpuName>>,
+    /// The network card on screen, read every tick: keyed by its node so a reading never
+    /// lands on the card selected after it was taken.
+    net_facts: Option<(Box<str>, NetFacts)>,
+    /// Its wireless connection, handed in by the application from NetworkManager.
+    wifi: Option<(Box<str>, WifiInfo)>,
     /// The rail as it stands: the two machine-wide rows, then a row per device.
     devices: Vec<Device>,
     /// What those disks and cards are. Read once each, when they first appear.
@@ -361,6 +368,8 @@ impl Performance {
             gpus: Gpus::new(),
             gpu_history: Vec::new(),
             gpu_names: Vec::new(),
+            net_facts: None,
+            wifi: None,
             // The two rows that are there before anything has been sampled. The first tick
             // adds the devices.
             devices: rail(0, 0, 0),
@@ -455,6 +464,7 @@ impl Performance {
                 self.gpu_history.len(),
             );
         }
+        self.refresh_net();
 
         if self.per_core {
             let cores = self.probe.cpu_cores().len();
@@ -547,7 +557,7 @@ impl Performance {
         )
         // No grid in a thumbnail: the reference draws none, and six by ten inside eighty by
         // fifty-four pixels would be a hatch rather than a grid.
-        .style(Style::Curve { cols: 1, rows: 1 })
+        .style(graph_style(kind, 1, 1))
         .into()
     }
 
@@ -619,10 +629,7 @@ impl Performance {
                     self.rings_of(self.device),
                     0,
                     PLOT_HEIGHT,
-                    Style::Curve {
-                        cols: GRID_COLS,
-                        rows: GRID_ROWS,
-                    },
+                    graph_style(self.device.kind(), GRID_COLS, GRID_ROWS),
                 )
             };
         let graph = if self.device == Device::Cpu {
@@ -672,6 +679,7 @@ impl Performance {
                 .cards()
                 .get(i)
                 .map(|card| gpu_panel(card, self.gpu_name(Device::Gpu(i)))),
+            Device::Network(i) => Some(self.net_panel(i)),
             _ => None,
         };
         if let Some(facts) = facts {
@@ -864,6 +872,248 @@ impl Performance {
             ));
         }
         out
+    }
+
+    /// Shows `device`, and reads a network card's details straight away rather than leaving
+    /// the page without them until the next tick.
+    pub fn select(&mut self, device: Device) {
+        self.device = device;
+        self.refresh_net();
+    }
+
+    /// The network card on screen gets its details read; any other device clears them.
+    fn refresh_net(&mut self) {
+        self.net_facts = match self.device {
+            Device::Network(_) => {
+                let node = self.node(self.device);
+                (!node.is_empty()).then(|| (node.into(), NetFacts::read(node)))
+            }
+            _ => None,
+        };
+    }
+
+    /// The interface to ask NetworkManager about: the card on screen, when it is wireless.
+    #[must_use]
+    pub fn wireless(&self) -> Option<String> {
+        let Device::Network(_) = self.device else {
+            return None;
+        };
+        let node = self.node(self.device);
+        self.catalog
+            .interface(node)
+            .is_some_and(|card| card.kind == LinkKind::Wireless)
+            .then(|| node.to_owned())
+    }
+
+    /// What NetworkManager answered for `iface`; `None` clears what was shown.
+    pub fn set_wifi(&mut self, iface: String, info: Option<WifiInfo>) {
+        self.wifi = info.map(|info| (iface.into_boxed_str(), info));
+    }
+
+    /// The facts column of a network card.
+    ///
+    /// Two groups of pairs: the rates now, each with a stretch of the line it is drawn in -
+    /// the graph's legend, as the reference puts it - then the totals since the card came up,
+    /// and the signal of a wireless one. Under them a list of what the card is, and its
+    /// addresses, each under its key on lines of their own: an IPv6 address does not fit
+    /// beside a key in this width. Every line is drawn only when its source answered.
+    fn net_panel(&self, i: usize) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let device = Device::Network(i);
+        let node = self.node(device);
+        let facts = self
+            .net_facts
+            .as_ref()
+            .filter(|(at, _)| **at == *node)
+            .map(|(_, facts)| facts);
+        let wifi = self
+            .wifi
+            .as_ref()
+            .filter(|(at, _)| **at == *node)
+            .map(|(_, info)| info);
+        let card = self.catalog.interface(node);
+        let rates = self
+            .probe
+            .nets()
+            .get(i)
+            .map_or([0.0; 2], |meter| meter.rate);
+        let color = self.colors.bands[Kind::Network.bands()[0] as usize].unwrap_or(Color::WHITE);
+
+        let pair = |label: String, value: String| {
+            widget::column::with_capacity(2)
+                .push(widget::text::caption(label).wrapping(Wrapping::None))
+                .push(widget::text::heading(value).wrapping(Wrapping::None))
+                .apply(Element::from)
+        };
+        let legend = |label: String, value: String, dashed: bool| {
+            let sample = widget::canvas(LineSample { color, dashed })
+                .width(Length::Fixed(LEGEND_WIDTH))
+                .height(Length::Fixed(LEGEND_HEIGHT));
+            widget::column::with_capacity(2)
+                .push(
+                    widget::row::with_capacity(2)
+                        .spacing(spacing.space_xxs)
+                        .align_y(Alignment::Center)
+                        .push(sample)
+                        .push(widget::text::caption(label).wrapping(Wrapping::None)),
+                )
+                .push(widget::text::heading(value).wrapping(Wrapping::None))
+                .apply(Element::from)
+        };
+        let line = |label: String, value: String| {
+            widget::row::with_capacity(2)
+                .push(
+                    widget::text::caption(label)
+                        .wrapping(Wrapping::None)
+                        .width(Length::Fixed(FACT_KEY_WIDTH)),
+                )
+                .push(widget::text::caption(value).wrapping(Wrapping::None))
+        };
+        let both = |(rx, tx): (u64, u64)| fl!("net-pair", rx = rx.to_string(), tx = tx.to_string());
+
+        let mut panel = widget::column::with_capacity(6)
+            .spacing(spacing.space_xxs)
+            .push(group(vec![
+                legend(fl!("net-receive"), rate(rates[0]), false),
+                legend(fl!("net-send"), rate(rates[1]), true),
+            ]));
+        if let Some((rx, tx)) = facts.and_then(|facts| facts.bytes) {
+            panel = panel.push(group(vec![
+                pair(fl!("net-received"), size(rx)),
+                pair(fl!("net-sent"), size(tx)),
+            ]));
+        }
+        if let Some(wifi) = wifi {
+            panel = panel.push(group(vec![pair(
+                fl!("net-signal"),
+                percent(f32::from(wifi.strength) / 100.0),
+            )]));
+        }
+
+        let mut list = widget::column::with_capacity(14).spacing(spacing.space_xxxs);
+        let down = facts.is_some_and(|facts| facts.down);
+        if down {
+            list = list.push(line(fl!("fact-net-state"), fl!("fact-net-disconnected")));
+        }
+        if let Some(card) = card {
+            list = list.push(line(
+                fl!("fact-net-type"),
+                match card.kind {
+                    LinkKind::Wireless => fl!("device-net-wireless"),
+                    _ => fl!("device-net-ethernet"),
+                },
+            ));
+        }
+        if let Some(wifi) = wifi {
+            list = list.push(line(fl!("fact-net-ssid"), wifi.ssid.clone()));
+            if let Some(band) = wifi.band {
+                let ghz = match band {
+                    WifiBand::TwoFour => "2.4",
+                    WifiBand::Five => "5",
+                    WifiBand::Six => "6",
+                };
+                list = list.push(line(fl!("fact-net-band"), fl!("net-band", value = ghz)));
+            }
+        }
+        let speed = match wifi {
+            Some(wifi) => wifi.bitrate_mbps.map(link_speed),
+            None => facts.and_then(|facts| {
+                let speed = link_speed(facts.speed_mbps?);
+                Some(match facts.duplex {
+                    Some(Duplex::Full) => {
+                        fl!(
+                            "net-speed-duplex",
+                            speed = speed,
+                            duplex = fl!("net-duplex-full")
+                        )
+                    }
+                    Some(Duplex::Half) => {
+                        fl!(
+                            "net-speed-duplex",
+                            speed = speed,
+                            duplex = fl!("net-duplex-half")
+                        )
+                    }
+                    None => speed,
+                })
+            }),
+        };
+        if let Some(speed) = speed.filter(|_| !down) {
+            list = list.push(line(fl!("fact-net-speed"), speed));
+        }
+        if let Some(facts) = facts {
+            if let Some(mac) = &facts.mac {
+                list = list.push(line(fl!("fact-net-mac"), mac.clone()));
+            }
+            if let Some(mtu) = facts.mtu {
+                list = list.push(line(fl!("fact-net-mtu"), mtu.to_string()));
+            }
+            if let Some(driver) = &facts.driver {
+                list = list.push(line(fl!("fact-net-driver"), driver.clone()));
+            }
+        }
+        list = list.push(line(fl!("fact-net-interface"), node.to_owned()));
+        if let Some(facts) = facts {
+            for (label, counts) in [
+                (fl!("fact-net-packets"), facts.packets),
+                (fl!("fact-net-errors"), facts.errors),
+                (fl!("fact-net-dropped"), facts.dropped),
+            ] {
+                if let Some(counts) = counts {
+                    list = list.push(line(label, both(counts)));
+                }
+            }
+        }
+        panel = panel.push(list);
+
+        // Addresses under their keys, one per line, free to wrap: the longest IPv6 address is
+        // wider than the column beside a key.
+        if let Some(facts) = facts.filter(|facts| !facts.down) {
+            let block = |key: String, values: Vec<String>| -> Option<Element<'_, Message>> {
+                if values.is_empty() {
+                    return None;
+                }
+                let mut lines = widget::column::with_capacity(values.len() + 1)
+                    .push(widget::text::caption(key).wrapping(Wrapping::None));
+                for value in values {
+                    lines = lines.push(widget::text::caption(value));
+                }
+                Some(lines.into())
+            };
+            let blocks = [
+                block(
+                    fl!("fact-net-ipv4"),
+                    facts
+                        .ipv4
+                        .iter()
+                        .map(|(ip, prefix)| format!("{ip}/{prefix}"))
+                        .collect(),
+                ),
+                block(
+                    fl!("fact-net-ipv6"),
+                    facts
+                        .ipv6
+                        .iter()
+                        .map(|(ip, prefix)| format!("{ip}/{prefix}"))
+                        .collect(),
+                ),
+                block(
+                    fl!("fact-net-gateway"),
+                    facts
+                        .gateway4
+                        .map(|ip| ip.to_string())
+                        .into_iter()
+                        .chain(facts.gateway6.map(|ip| ip.to_string()))
+                        .collect(),
+                ),
+            ];
+            let mut addresses = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
+            for block in blocks.into_iter().flatten() {
+                addresses = addresses.push(block);
+            }
+            panel = panel.push(addresses);
+        }
+        panel.into()
     }
 
     /// The last sample, for whoever needs the machine-wide figures.
@@ -1387,6 +1637,57 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
         panel = panel.push(group(row.iter().map(|fact| figure(*fact)).collect()));
     }
     panel.push(list).into()
+}
+
+/// The style a device's graph is drawn in: a network card's two directions as lines of their
+/// own, receive solid and send dashed as the reference draws them; everything else as one
+/// curve.
+fn graph_style(kind: Kind, cols: u16, rows: u16) -> Style {
+    if matches!(kind, Kind::Network) {
+        Style::Lines { cols, rows }
+    } else {
+        Style::Curve { cols, rows }
+    }
+}
+
+/// The stretch of line beside a rate in the network facts: what that rate looks like on the
+/// graph.
+const LEGEND_WIDTH: f32 = 16.0;
+const LEGEND_HEIGHT: f32 = 8.0;
+
+/// A stretch of a graph line, solid or dashed, in the device's colour.
+struct LineSample {
+    color: Color,
+    dashed: bool,
+}
+
+impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for LineSample {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &cosmic::Renderer,
+        _theme: &cosmic::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry<cosmic::Renderer>> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        // Half a pixel down, so the 1px stroke lands on a row and not across two.
+        let y = (bounds.height / 2.0).round() + 0.5;
+        let path = canvas::Path::line(Point::new(0.0, y), Point::new(bounds.width, y));
+        let mut stroke = canvas::Stroke::default()
+            .with_color(self.color)
+            .with_width(1.0);
+        if self.dashed {
+            stroke.line_dash = canvas::LineDash {
+                segments: &LINE_DASH,
+                offset: 0,
+            };
+        }
+        frame.stroke(&path, stroke);
+        vec![frame.into_geometry()]
+    }
 }
 
 /// What to call a drive of this kind, or nothing when the machine would not say.
