@@ -61,7 +61,8 @@ device-disk-removable = Removable
 device-gpu = GPU
 # What a device is, and under which name the kernel knows it.
 device-node = { $what } ({ $node })
-device-disk-node = { $node }, { $size }
+device-disk = Disk
+device-disk-aside = { $model }, { $size }
 link-mbit = { $value } Mbit/s
 link-gbit = { $value } Gbit/s
 

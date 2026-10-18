@@ -60,7 +60,8 @@ device-disk-hdd = HDD
 device-disk-removable = Змінний
 device-gpu = Відеокарта
 device-node = { $what } ({ $node })
-device-disk-node = { $node }, { $size }
+device-disk = Диск
+device-disk-aside = { $model }, { $size }
 link-mbit = { $value } Мбіт/с
 link-gbit = { $value } Гбіт/с
 

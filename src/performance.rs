@@ -679,8 +679,10 @@ impl Performance {
         // row of a column that has rows to spare; a disk and a card put there what the rail
         // row has no width for - the drive's node and size, the card's full name.
         // The heading has the width the rail has not, so it carries the name whole.
+        // A gap between the two, so that a long name on either side never runs into the other.
         let mut heading = widget::row::with_capacity(3)
             .align_y(Alignment::Center)
+            .spacing(spacing.space_s)
             .push(widget::text::title3(self.heading_title(self.device)))
             .push(widget::Space::new().width(Length::Fill));
         let aside = self.aside(self.device);
@@ -1674,12 +1676,18 @@ impl Performance {
         }
     }
 
-    /// The heading of the page: the rail's name, except for a network card, which is headed
-    /// by what it is - `Ethernet`, `Wi-Fi` - as the reference heads it, with its full name
-    /// beside. Its short model is long enough to leave the full name no room beside it once
-    /// the facts column takes its share of the width.
+    /// The heading of the page: the rail's name, except for a network card and a disk, which
+    /// are headed by what they are - `Ethernet`, `Wi-Fi`, `Диск (nvme0n1)` - as the reference
+    /// heads them, with the full name beside. A model is long enough to leave the rest no room
+    /// beside it once the facts column takes its share of the width.
     fn heading_title(&self, device: Device) -> String {
         match device {
+            // `Диск (nvme0n1)`: a drive's model is as long as a card's, and goes beside.
+            Device::Disk(_) => fl!(
+                "device-node",
+                what = fl!("device-disk"),
+                node = self.node(device)
+            ),
             Device::Network(_) => match self.catalog.interface(self.node(device)) {
                 Some(card) if card.kind == LinkKind::Wireless => fl!("device-net-wireless"),
                 _ => fl!("device-net-ethernet"),
@@ -1720,11 +1728,20 @@ impl Performance {
         match device {
             Device::Cpu => self.facts.model.clone(),
             Device::Memory => String::new(),
+            // The model and the size; the node is in the heading.
             Device::Disk(_) => {
-                let node = self.node(device);
-                match self.catalog.disk(node).filter(|disk| disk.size > 0) {
-                    Some(disk) => fl!("device-disk-node", node = node, size = size(disk.size)),
-                    None => node.to_owned(),
+                let Some(disk) = self.catalog.disk(self.node(device)) else {
+                    return String::new();
+                };
+                match (disk.model.is_empty(), disk.size > 0) {
+                    (false, true) => fl!(
+                        "device-disk-aside",
+                        model = disk.model.clone(),
+                        size = size(disk.size)
+                    ),
+                    (false, false) => disk.model.clone(),
+                    (true, true) => size(disk.size),
+                    (true, false) => String::new(),
                 }
             }
             Device::Network(_) => self
