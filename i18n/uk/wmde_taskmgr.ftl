@@ -159,4 +159,16 @@ fact-net-ipv4 = IPv4-адреса
 fact-net-ipv6 = IPv6-адреса
 fact-net-gateway = Основний шлюз
 
+disk-read = Читання
+disk-write = Запис
+fact-disk-active = Активний час
+fact-disk-response = Середній час відгуку
+response-ms = { $value } мс
+fact-disk-type = Тип:
+fact-disk-capacity = Ємність:
+fact-disk-formatted = Відформатовано:
+fact-disk-system = Системний диск:
+fact-disk-swap = Файл підкачки:
+fact-disk-mounts = Точки монтування
+
 speed-ghz = { $value } ГГц

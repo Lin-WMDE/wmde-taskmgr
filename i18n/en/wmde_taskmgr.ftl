@@ -167,4 +167,17 @@ fact-net-ipv4 = IPv4 address
 fact-net-ipv6 = IPv6 address
 fact-net-gateway = Default gateway
 
+# Disk page, in the column the processor page fills with its facts.
+disk-read = Read
+disk-write = Write
+fact-disk-active = Active time
+fact-disk-response = Average response time
+response-ms = { $value } ms
+fact-disk-type = Type:
+fact-disk-capacity = Capacity:
+fact-disk-formatted = Formatted:
+fact-disk-system = System disk:
+fact-disk-swap = Swap:
+fact-disk-mounts = Mount points
+
 speed-ghz = { $value } GHz

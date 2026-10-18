@@ -2,6 +2,7 @@
 
 mod app;
 mod devices;
+mod disk;
 mod facts;
 mod gpu;
 mod group;

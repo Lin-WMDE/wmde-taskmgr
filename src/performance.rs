@@ -21,6 +21,7 @@ use wmde_sysmon::probe::{DeviceRate, Probe, Sample, Sources};
 use crate::memory::Report;
 
 use crate::devices::{Catalog, DiskKind, GpuName, LinkKind};
+use crate::disk::{Activity, DiskFacts, DiskStats};
 use crate::facts::{Facts, Live};
 use crate::fl;
 use crate::gpu::{Card, Fan, Gpus};
@@ -317,6 +318,13 @@ pub struct Performance {
     /// One set per disk and one per network card, in the probe's order.
     disks: Vec<Rings>,
     nets: Vec<Rings>,
+    /// Each disk's active time, as a share in its first band, beside `disks`.
+    disk_active: Vec<Rings>,
+    disk_stats: DiskStats,
+    /// Each disk's active time and response time over the last tick, in `disks` order.
+    disk_activity: Vec<Option<Activity>>,
+    /// The disk on screen: what lives on it, keyed by its node.
+    disk_facts: Option<(Box<str>, DiskFacts)>,
     /// The graphics cards, found once, and a history for each in the same order.
     gpus: Gpus,
     gpu_history: Vec<GpuHistory>,
@@ -370,6 +378,10 @@ impl Performance {
             cores: Vec::new(),
             disks: Vec::new(),
             nets: Vec::new(),
+            disk_active: Vec::new(),
+            disk_stats: DiskStats::default(),
+            disk_activity: Vec::new(),
+            disk_facts: None,
             gpus: Gpus::new(),
             gpu_history: Vec::new(),
             gpu_names: Vec::new(),
@@ -434,6 +446,22 @@ impl Performance {
         push_devices(&mut self.disks, Kind::Disk, self.probe.disks());
         push_devices(&mut self.nets, Kind::Network, self.probe.nets());
 
+        let names: Vec<&str> = self
+            .probe
+            .disks()
+            .iter()
+            .map(|meter| &*meter.name)
+            .collect();
+        self.disk_activity = self.disk_stats.sample(&names, Instant::now());
+        if self.disk_active.len() != names.len() {
+            self.disk_active = (0..names.len()).map(|_| rings()).collect();
+        }
+        for (set, activity) in self.disk_active.iter_mut().zip(&self.disk_activity) {
+            if let Some(activity) = activity {
+                set[Kind::Disk.index()].push(&[activity.active, 0.0]);
+            }
+        }
+
         self.gpus.sample(Instant::now());
         let cards = self.gpus.cards();
         if self.gpu_history.len() != cards.len() {
@@ -472,6 +500,7 @@ impl Performance {
             );
         }
         self.refresh_net();
+        self.refresh_disk();
 
         if self.per_core {
             let cores = self.probe.cpu_cores().len();
@@ -485,8 +514,8 @@ impl Performance {
             self.cores.clear();
         }
 
-        // The large plot, a thumbnail per rail row, a tile per core, and a graphics card's
-        // temperature and two memory graphs last.
+        // The large plot, a thumbnail per rail row, a tile per core, and the small graphs of
+        // the page last: a graphics card's three, a disk's one.
         let needed = 1 + self.devices.len() + self.cores.len() + 3;
         while self.caches.len() < needed {
             self.caches.push(canvas::Cache::new());
@@ -519,10 +548,11 @@ impl Performance {
         cache: usize,
         height: f32,
         style: Style,
+        ceiling: Option<f32>,
     ) -> Element<'a, Message> {
         let cache = &self.caches[cache.min(self.caches.len() - 1)];
         widget::responsive(move |size| {
-            Strip::new(
+            let strip = Strip::new(
                 &Kind::ALL[kind.index()..=kind.index()],
                 history,
                 &self.colors,
@@ -534,8 +564,11 @@ impl Performance {
                     gap: 0.0,
                 },
             )
-            .style(style)
-            .into()
+            .style(style);
+            match ceiling {
+                Some(top) => strip.ceiling(top).into(),
+                None => strip.into(),
+            }
         })
         .height(Length::Fixed(height))
         .into()
@@ -637,6 +670,7 @@ impl Performance {
                     0,
                     PLOT_HEIGHT,
                     graph_style(self.device.kind(), GRID_COLS, GRID_ROWS),
+                    None,
                 )
             };
         let graph = if self.device == Device::Cpu {
@@ -655,6 +689,11 @@ impl Performance {
         }
         if let Device::Gpu(i) = self.device {
             for element in self.gpu_graphs(i) {
+                main = main.push(element);
+            }
+        }
+        if let Device::Disk(i) = self.device {
+            for element in self.disk_graphs(i) {
                 main = main.push(element);
             }
         }
@@ -687,6 +726,7 @@ impl Performance {
                 .get(i)
                 .map(|card| gpu_panel(card, self.gpu_name(Device::Gpu(i)))),
             Device::Network(i) => Some(self.net_panel(i)),
+            Device::Disk(i) => Some(self.disk_panel(i)),
             _ => None,
         };
         if let Some(facts) = facts {
@@ -876,6 +916,7 @@ impl Performance {
                     cols: GRID_COLS,
                     rows: MEMORY_GRID_ROWS,
                 },
+                None,
             ));
         }
         out
@@ -886,6 +927,7 @@ impl Performance {
     pub fn select(&mut self, device: Device) {
         self.device = device;
         self.refresh_net();
+        self.refresh_disk();
     }
 
     /// The network card on screen gets its details read; any other device clears them.
@@ -897,6 +939,137 @@ impl Performance {
             }
             _ => None,
         };
+    }
+
+    /// The disk on screen gets what lives on it read; any other device clears it.
+    fn refresh_disk(&mut self) {
+        self.disk_facts = match self.device {
+            Device::Disk(_) => {
+                let node = self.node(self.device);
+                (!node.is_empty()).then(|| (node.into(), DiskFacts::read(node)))
+            }
+            _ => None,
+        };
+    }
+
+    /// Under a disk's transfer graph: its active time, against a fixed hundred per cent in
+    /// the disk's colour.
+    fn disk_graphs(&self, i: usize) -> Vec<Element<'_, Message>> {
+        let Some(history) = self.disk_active.get(i) else {
+            return Vec::new();
+        };
+        vec![
+            widget::row::with_capacity(3)
+                .push(widget::text::caption(fl!("fact-disk-active")))
+                .push(widget::Space::new().width(Length::Fill))
+                .push(widget::text::caption(percent(1.0)))
+                .into(),
+            self.plot(
+                Kind::Disk,
+                history,
+                1 + self.devices.len() + self.cores.len(),
+                MEMORY_PLOT_HEIGHT,
+                Style::Curve {
+                    cols: GRID_COLS,
+                    rows: MEMORY_GRID_ROWS,
+                },
+                Some(1.0),
+            ),
+        ]
+    }
+
+    /// The facts column of a disk: the rates with their legend, how busy it is and how fast
+    /// it answers, then what it is and what lives on it.
+    fn disk_panel(&self, i: usize) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let device = Device::Disk(i);
+        let node = self.node(device);
+        let disk = self.catalog.disk(node);
+        let facts = self
+            .disk_facts
+            .as_ref()
+            .filter(|(at, _)| **at == *node)
+            .map(|(_, facts)| facts);
+        let activity = self.disk_activity.get(i).copied().flatten();
+        let rates = self
+            .probe
+            .disks()
+            .get(i)
+            .map_or([0.0; 2], |meter| meter.rate);
+        let color = self.colors.bands[Kind::Disk.bands()[0] as usize].unwrap_or(Color::WHITE);
+
+        let pair = |label: String, value: String| {
+            widget::column::with_capacity(2)
+                .push(widget::text::caption(label).wrapping(Wrapping::None))
+                .push(widget::text::heading(value).wrapping(Wrapping::None))
+                .apply(Element::from)
+        };
+        let legend = |label: String, value: String, dashed: bool| {
+            legend_pair(
+                label,
+                value,
+                LineSample { color, dashed },
+                spacing.space_xxs,
+            )
+        };
+        let line = |label: String, value: String| {
+            widget::row::with_capacity(2)
+                .push(
+                    widget::text::caption(label)
+                        .wrapping(Wrapping::None)
+                        .width(Length::Fixed(DEVICE_KEY_WIDTH)),
+                )
+                .push(widget::text::caption(value).wrapping(Wrapping::WordOrGlyph))
+        };
+        let yes_no = |yes: bool| if yes { fl!("fact-yes") } else { fl!("fact-no") };
+
+        let mut panel = widget::column::with_capacity(5)
+            .spacing(spacing.space_xxs)
+            .push(group(vec![
+                legend(fl!("disk-read"), rate(rates[0]), false),
+                legend(fl!("disk-write"), rate(rates[1]), true),
+            ]));
+        if let Some(activity) = activity {
+            panel = panel.push(group(vec![
+                pair(fl!("fact-disk-active"), percent(activity.active)),
+                pair(
+                    fl!("fact-disk-response"),
+                    fl!(
+                        "response-ms",
+                        value = format!("{:.1}", activity.response_ms)
+                    ),
+                ),
+            ]));
+        }
+
+        let mut list = widget::column::with_capacity(6).spacing(spacing.space_xxxs);
+        if let Some(kind) = disk.and_then(|disk| disk_kind(disk.kind)) {
+            list = list.push(line(fl!("fact-disk-type"), kind));
+        }
+        if let Some(bytes) = disk.map(|disk| disk.size).filter(|size| *size > 0) {
+            list = list.push(line(fl!("fact-disk-capacity"), size(bytes)));
+        }
+        if let Some(facts) = facts {
+            if let Some(bytes) = facts.formatted {
+                list = list.push(line(fl!("fact-disk-formatted"), size(bytes)));
+            }
+            list = list
+                .push(line(fl!("fact-disk-system"), yes_no(facts.system)))
+                .push(line(fl!("fact-disk-swap"), yes_no(facts.swap)));
+        }
+        panel = panel.push(list);
+
+        // Mount points under their key, one per line and free to wrap: a removable drive is
+        // mounted under a path with the user's and the volume's names in it.
+        if let Some(facts) = facts.filter(|facts| !facts.mounts.is_empty()) {
+            let mut mounts = widget::column::with_capacity(facts.mounts.len() + 1)
+                .push(widget::text::caption(fl!("fact-disk-mounts")).wrapping(Wrapping::None));
+            for point in &facts.mounts {
+                mounts = mounts.push(widget::text::caption(point.clone()));
+            }
+            panel = panel.push(mounts);
+        }
+        panel.into()
     }
 
     /// The interface to ask NetworkManager about: the card on screen, when it is wireless.
@@ -953,19 +1126,12 @@ impl Performance {
                 .apply(Element::from)
         };
         let legend = |label: String, value: String, dashed: bool| {
-            let sample = widget::canvas(LineSample { color, dashed })
-                .width(Length::Fixed(LEGEND_WIDTH))
-                .height(Length::Fixed(LEGEND_HEIGHT));
-            widget::column::with_capacity(2)
-                .push(
-                    widget::row::with_capacity(2)
-                        .spacing(spacing.space_xxs)
-                        .align_y(Alignment::Center)
-                        .push(sample)
-                        .push(widget::text::caption(label).wrapping(Wrapping::None)),
-                )
-                .push(widget::text::heading(value).wrapping(Wrapping::None))
-                .apply(Element::from)
+            legend_pair(
+                label,
+                value,
+                LineSample { color, dashed },
+                spacing.space_xxs,
+            )
         };
         // A narrower key than the other pages: a MAC, a packet count or a link speed is wider
         // than what is left beside `FACT_KEY_WIDTH`, and is wrapped rather than cut if it still
@@ -1292,6 +1458,7 @@ impl Performance {
                                     cols: GRID_COLS,
                                     rows: GRID_ROWS,
                                 },
+                                None,
                             ))
                             .width(Length::FillPortion(1)),
                         ),
@@ -1699,10 +1866,11 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
     panel.push(list).into()
 }
 
-/// The style a device's graph is drawn in: a network card's two directions as lines of their
-/// own, receive solid and send dashed; everything else as one curve.
+/// The style a device's graph is drawn in: a network card's and a disk's two directions as
+/// lines of their own - receive and read solid, send and write dashed; everything else as one
+/// curve.
 fn graph_style(kind: Kind, cols: u16, rows: u16) -> Style {
-    if matches!(kind, Kind::Network) {
+    if matches!(kind, Kind::Network | Kind::Disk) {
         Style::Lines { cols, rows }
     } else {
         Style::Curve { cols, rows }
@@ -1713,6 +1881,30 @@ fn graph_style(kind: Kind, cols: u16, rows: u16) -> Style {
 /// graph.
 const LEGEND_WIDTH: f32 = 16.0;
 const LEGEND_HEIGHT: f32 = 8.0;
+
+/// A figure of the facts column with a stretch of its graph line before the label: the
+/// graph's legend, as the reference puts it beside a network card's and a disk's rates.
+fn legend_pair<'a>(
+    label: String,
+    value: String,
+    sample: LineSample,
+    gap: u16,
+) -> Element<'a, Message> {
+    widget::column::with_capacity(2)
+        .push(
+            widget::row::with_capacity(2)
+                .spacing(gap)
+                .align_y(Alignment::Center)
+                .push(
+                    widget::canvas(sample)
+                        .width(Length::Fixed(LEGEND_WIDTH))
+                        .height(Length::Fixed(LEGEND_HEIGHT)),
+                )
+                .push(widget::text::caption(label).wrapping(Wrapping::None)),
+        )
+        .push(widget::text::heading(value).wrapping(Wrapping::None))
+        .into()
+}
 
 /// A stretch of a graph line, solid or dashed, in the device's colour.
 struct LineSample {
