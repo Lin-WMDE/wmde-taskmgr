@@ -1387,6 +1387,18 @@ impl Performance {
         panel.into()
     }
 
+    /// What a process asked of the graphics cards over the last tick.
+    #[must_use]
+    pub fn gpu_usage(&self, pid: u32) -> crate::gpu::GpuUse {
+        self.gpus.usage(pid)
+    }
+
+    /// The busiest graphics card's utilization, for the process list's heading.
+    #[must_use]
+    pub fn gpu_busiest(&self) -> Option<f32> {
+        self.gpus.busiest()
+    }
+
     /// The last sample, for whoever needs the machine-wide figures.
     #[must_use]
     pub fn last(&self) -> &Sample {

@@ -19,7 +19,7 @@
 //! one - is listed with its name and no reading. Nothing here needs root or starts a
 //! process: `nvidia-smi` would cost a process every tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr, c_char, c_int, c_uint, c_void};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -69,6 +69,9 @@ pub struct Card {
     thermal: Option<PathBuf>,
     /// Where the rest of its sensors are, found once at start-up.
     sensors: Sensors,
+    /// The newest per-process sample NVML has handed over, in its microseconds; the next call
+    /// asks only for what came after it.
+    nvml_seen: u64,
 }
 
 /// One engine class of a card and the share of the interval it was busy, `0.0..=1.0`.
@@ -85,6 +88,17 @@ pub struct ProcessGpu {
     pub busy: Option<f32>,
     /// Bytes its clients hold, in every memory region.
     pub memory: Option<u64>,
+}
+
+/// What the process list can say about one process's use of the cards.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum GpuUse {
+    /// No client of any card: the process does not use one.
+    #[default]
+    None,
+    /// Its descriptors are closed to this user, so whether it uses a card is unknown.
+    Denied,
+    Known(ProcessGpu),
 }
 
 /// How fast a card's fan turns: NVML says it as a share of the fan's top speed, `hwmon` in
@@ -142,6 +156,8 @@ pub struct Gpus {
     walked_at: Option<Instant>,
     /// Each process's use of the cards, by pid.
     processes: HashMap<u32, ProcessGpu>,
+    /// Processes whose descriptors the last walk could not read.
+    denied: HashSet<u32>,
 }
 
 impl Gpus {
@@ -203,6 +219,7 @@ impl Gpus {
                 source,
                 thermal,
                 sensors,
+                nvml_seen: 0,
             });
         }
         cards.sort_by_key(|card| card_number(&card.node));
@@ -228,12 +245,31 @@ impl Gpus {
             engine_prev: HashMap::new(),
             walked_at: None,
             processes: HashMap::new(),
+            denied: HashSet::new(),
         }
     }
 
-    /// What each process asked of the cards over the last tick, by pid. A process with no
-    /// client of a card is absent.
-    pub fn processes(&self) -> &HashMap<u32, ProcessGpu> {
+    /// What a process asked of the cards over the last tick.
+    pub fn usage(&self, pid: u32) -> GpuUse {
+        match self.processes.get(&pid) {
+            Some(known) => GpuUse::Known(*known),
+            None if self.denied.contains(&pid) => GpuUse::Denied,
+            None => GpuUse::None,
+        }
+    }
+
+    /// The busiest card's utilization, for the heading of the process list's column.
+    pub fn busiest(&self) -> Option<f32> {
+        self.cards
+            .iter()
+            .filter_map(|card| card.busy)
+            .fold(None, |top, busy| {
+                Some(top.map_or(busy, |top: f32| top.max(busy)))
+            })
+    }
+
+    #[cfg(test)]
+    fn processes(&self) -> &HashMap<u32, ProcessGpu> {
         &self.processes
     }
 
@@ -248,8 +284,10 @@ impl Gpus {
             engine_prev,
             walked_at,
             processes,
+            denied,
         } = self;
         processes.clear();
+        denied.clear();
         for card in cards.iter_mut() {
             match &mut card.source {
                 Source::None => {}
@@ -292,6 +330,13 @@ impl Gpus {
                 card.clocks = nvml.clocks(*handle);
                 card.power = nvml.power(*handle);
                 card.fan = nvml.fan(*handle).map(Fan::Percent);
+                for (pid, busy) in nvml.process_busy(*handle, &mut card.nvml_seen) {
+                    let entry = &mut processes.entry(pid).or_default().busy;
+                    *entry = Some(entry.map_or(busy, |seen: f32| seen.max(busy)));
+                }
+                for (pid, bytes) in nvml.process_memory(*handle) {
+                    *processes.entry(pid).or_default().memory.get_or_insert(0) += bytes;
+                }
                 card.engines = [
                     ("dec", nvml.decoder(*handle)),
                     ("enc", nvml.encoder(*handle)),
@@ -330,7 +375,7 @@ impl Gpus {
         if !cards.iter().any(walks) {
             return;
         }
-        let clients = drm_clients(proc, buf);
+        let clients = drm_clients(proc, buf, denied);
         let elapsed = walked_at
             .map(|at| now.saturating_duration_since(at).as_nanos() as f64)
             .filter(|ns| *ns > 0.0);
@@ -466,6 +511,7 @@ impl Card {
             source: Source::None,
             thermal: None,
             sensors: Sensors::default(),
+            nvml_seen: 0,
         }
     }
 }
@@ -724,7 +770,7 @@ fn parse_size(value: &str) -> Option<u64> {
 /// `readlink`. A client is counted once however many descriptors it has open. A card none of
 /// whose clients reports memory is left out, so it reads as having no source rather than as
 /// holding nothing.
-fn drm_clients(proc: &Path, buf: &mut Vec<u8>) -> Vec<(u32, Client)> {
+fn drm_clients(proc: &Path, buf: &mut Vec<u8>, denied: &mut HashSet<u32>) -> Vec<(u32, Client)> {
     let mut clients: Vec<(u32, Client)> = Vec::new();
     for process in std::fs::read_dir(proc).into_iter().flatten().flatten() {
         let Some(pid) = process
@@ -735,8 +781,15 @@ fn drm_clients(proc: &Path, buf: &mut Vec<u8>) -> Vec<(u32, Client)> {
             continue;
         };
         let dir = process.path();
-        let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
-            continue;
+        let fds = match std::fs::read_dir(dir.join("fd")) {
+            Ok(fds) => fds,
+            Err(err) => {
+                // Another account's process: whether it uses a card is not ours to see.
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied.insert(pid);
+                }
+                continue;
+            }
         };
         for fd in fds.flatten() {
             let Ok(target) = std::fs::read_link(fd.path()) else {
@@ -821,6 +874,37 @@ const NVML_MEMORY_V2: c_uint = std::mem::size_of::<NvmlMemoryV2>() as c_uint | 2
 /// `NVML_TEMPERATURE_GPU`: the die.
 const NVML_TEMPERATURE_GPU: c_uint = 0;
 
+/// `nvmlProcessUtilizationSample_t`: one process's share of each engine over one sample.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NvmlProcessSample {
+    pid: c_uint,
+    time_stamp: u64,
+    sm: c_uint,
+    memory: c_uint,
+    encoder: c_uint,
+    decoder: c_uint,
+}
+
+/// `nvmlProcessInfo_t`, as the `_v3` calls fill it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NvmlProcessInfo {
+    pid: c_uint,
+    used_gpu_memory: u64,
+    gpu_instance_id: c_uint,
+    compute_instance_id: c_uint,
+}
+
+/// A call that fills a list says how long it would be.
+const NVML_ERROR_INSUFFICIENT_SIZE: c_int = 7;
+/// `NVML_VALUE_NOT_AVAILABLE`: the driver does not know how much memory the process holds.
+const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
+
+type ProcessList = unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut NvmlProcessInfo) -> c_int;
+type ProcessUtilization =
+    unsafe extern "C" fn(NvmlDevice, *mut NvmlProcessSample, *mut c_uint, u64) -> c_int;
+
 /// `nvmlClockType_t`: the graphics clock and the memory clock.
 const NVML_CLOCK_GRAPHICS: c_uint = 0;
 const NVML_CLOCK_MEM: c_uint = 2;
@@ -841,6 +925,9 @@ struct Nvml {
     fan_speed: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
     decoder: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> c_int>,
     encoder: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> c_int>,
+    process_utilization: Option<ProcessUtilization>,
+    graphics_processes: Option<ProcessList>,
+    compute_processes: Option<ProcessList>,
     /// Last, so it is dropped after the functions taken from it.
     _lib: libloading::Library,
 }
@@ -895,6 +982,18 @@ impl Nvml {
                 .get(b"nvmlDeviceGetEncoderUtilization\0")
                 .ok()
                 .map(|symbol| *symbol);
+            let process_utilization = lib
+                .get(b"nvmlDeviceGetProcessUtilization\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let graphics_processes = lib
+                .get(b"nvmlDeviceGetGraphicsRunningProcesses_v3\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let compute_processes = lib
+                .get(b"nvmlDeviceGetComputeRunningProcesses_v3\0")
+                .ok()
+                .map(|symbol| *symbol);
             let rc = init();
             if rc != NVML_SUCCESS {
                 tracing::warn!(
@@ -916,6 +1015,9 @@ impl Nvml {
                 fan_speed,
                 decoder,
                 encoder,
+                process_utilization,
+                graphics_processes,
+                compute_processes,
                 _lib: lib,
             })
         }
@@ -991,6 +1093,91 @@ impl Nvml {
             (rc == NVML_SUCCESS).then_some(mhz)
         };
         (clock(NVML_CLOCK_GRAPHICS), clock(NVML_CLOCK_MEM))
+    }
+
+    /// Each process's busiest engine - shader, encoder or decoder - over the samples NVML took
+    /// since the last call, as a share. `seen` carries the newest sample's time between calls.
+    fn process_busy(&self, device: usize, seen: &mut u64) -> Vec<(u32, f32)> {
+        let Some(call) = self.process_utilization else {
+            return Vec::new();
+        };
+        let mut count: c_uint = 0;
+        // SAFETY: a null list with a count of nothing asks how many samples there are.
+        let rc = unsafe {
+            call(
+                device as NvmlDevice,
+                std::ptr::null_mut(),
+                &mut count,
+                *seen,
+            )
+        };
+        if !(rc == NVML_SUCCESS || rc == NVML_ERROR_INSUFFICIENT_SIZE) || count == 0 {
+            return Vec::new();
+        }
+        let mut samples = vec![NvmlProcessSample::default(); count as usize];
+        // SAFETY: a list of `count` samples for NVML to fill.
+        let rc = unsafe {
+            call(
+                device as NvmlDevice,
+                samples.as_mut_ptr(),
+                &mut count,
+                *seen,
+            )
+        };
+        if rc != NVML_SUCCESS {
+            return Vec::new();
+        }
+        samples.truncate(count as usize);
+        *seen = samples
+            .iter()
+            .map(|sample| sample.time_stamp)
+            .max()
+            .unwrap_or(*seen);
+        let mut busiest: HashMap<u32, f32> = HashMap::new();
+        for sample in &samples {
+            let busy = sample.sm.max(sample.encoder).max(sample.decoder).min(100) as f32 / 100.0;
+            let entry = busiest.entry(sample.pid).or_default();
+            *entry = entry.max(busy);
+        }
+        busiest.into_iter().collect()
+    }
+
+    /// The video memory each process holds, from both the graphics and the compute lists; a
+    /// process on both is the same allocation, so the larger figure is taken.
+    fn process_memory(&self, device: usize) -> Vec<(u32, u64)> {
+        let mut held: HashMap<u32, u64> = HashMap::new();
+        for call in [self.graphics_processes, self.compute_processes]
+            .into_iter()
+            .flatten()
+        {
+            for info in Self::process_list(call, device) {
+                if info.used_gpu_memory == NVML_VALUE_NOT_AVAILABLE {
+                    continue;
+                }
+                let entry = held.entry(info.pid).or_default();
+                *entry = (*entry).max(info.used_gpu_memory);
+            }
+        }
+        held.into_iter().collect()
+    }
+
+    fn process_list(call: ProcessList, device: usize) -> Vec<NvmlProcessInfo> {
+        let mut count: c_uint = 0;
+        // SAFETY: a null list with a count of nothing asks how long the list is.
+        let rc = unsafe { call(device as NvmlDevice, &mut count, std::ptr::null_mut()) };
+        if rc != NVML_ERROR_INSUFFICIENT_SIZE || count == 0 {
+            return Vec::new();
+        }
+        // Room for a few that start between the two calls.
+        count += 8;
+        let mut list = vec![NvmlProcessInfo::default(); count as usize];
+        // SAFETY: a list of `count` entries for NVML to fill.
+        let rc = unsafe { call(device as NvmlDevice, &mut count, list.as_mut_ptr()) };
+        if rc != NVML_SUCCESS {
+            return Vec::new();
+        }
+        list.truncate(count as usize);
+        list
     }
 
     /// How busy the video decoder was, as a share.
@@ -1518,6 +1705,40 @@ mod tests {
         fs::write(sys.proc().join("500/fdinfo/3"), info(8, 100_000_000)).unwrap();
         gpus.sample(start + Duration::from_secs(1));
         assert_eq!(gpus.cards()[0].engines[0].busy, 0.0);
+    }
+
+    /// The per-process structs NVML fills, with C's padding.
+    #[test]
+    fn the_process_structs_are_the_ones_nvml_fills() {
+        assert_eq!(std::mem::size_of::<NvmlProcessSample>(), 32);
+        assert_eq!(std::mem::size_of::<NvmlProcessInfo>(), 24);
+    }
+
+    #[test]
+    fn a_process_is_known_unknown_or_not_using_a_card() {
+        let sys = Sysfs::new("usage");
+        sys.card("card1", "0000:00:02.0", "0x030000", "i915");
+        sys.descriptor(
+            500,
+            3,
+            "/dev/dri/renderD128",
+            "drm-client-id:\t7\ndrm-pdev:\t0000:00:02.0\ndrm-resident-system0:\t8 MiB\n",
+        );
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        gpus.sample(Instant::now());
+        assert_eq!(
+            gpus.usage(500),
+            GpuUse::Known(ProcessGpu {
+                busy: None,
+                memory: Some(8 << 20)
+            })
+        );
+        // A process with no client of a card uses none; one whose descriptors were closed to
+        // the walk is unknown.
+        assert_eq!(gpus.usage(700), GpuUse::None);
+        gpus.denied.insert(600);
+        assert_eq!(gpus.usage(600), GpuUse::Denied);
     }
 
     #[test]

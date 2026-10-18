@@ -215,7 +215,7 @@ impl App {
                     || p.cmdline.to_lowercase().contains(&needle)
                     || p.pid.to_string().contains(&needle)
             })
-            .map(Row::process)
+            .map(|p| Row::process(p, self.performance.gpu_usage(p.pid)))
             .collect();
         rows.sort_by(|a, b| {
             let order = crate::processes::compare(a, b, column);
@@ -271,6 +271,7 @@ impl App {
                 0.0
             },
             disk: s.disk[0] + s.disk[1],
+            gpu: self.performance.gpu_busiest(),
         });
     }
 
@@ -476,16 +477,20 @@ impl cosmic::Application for App {
         match message {
             Message::Tick => {
                 self.probe.sample();
-                // The users page first: it is what tells a scope that its login has gone, and
-                // the list below must not be built against a filter that no longer names
-                // anybody.
-                self.rebuild_users();
-                self.rebuild();
+                // The load half before the rows: the rows carry each process's use of the
+                // graphics cards, and the headings the machine-wide figures - both of this
+                // second, the one the rows describe.
                 self.performance.counts = (
                     self.probe.processes().count(),
                     self.probe.processes().map(|p| p.threads).sum(),
                 );
                 self.performance.tick();
+                self.publish_totals();
+                // The users page first: it is what tells a scope that its login has gone, and
+                // the list below must not be built against a filter that no longer names
+                // anybody.
+                self.rebuild_users();
+                self.rebuild();
 
                 // The wireless card on screen, every other tick, off the update thread.
                 self.wifi_tick = !self.wifi_tick;

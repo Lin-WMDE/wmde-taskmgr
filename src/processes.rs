@@ -9,6 +9,7 @@ use cosmic::widget::Icon;
 use cosmic::widget::table::{ItemCategory, ItemInterface};
 
 use crate::fl;
+use crate::gpu::GpuUse;
 use crate::probe::Process;
 use crate::users::Whose;
 
@@ -24,18 +25,24 @@ pub enum Column {
     Memory,
     Data,
     Disk,
+    /// The busiest engine of a graphics card the process used, as the reference's "GPU".
+    Gpu,
+    /// Memory its clients of a graphics card hold.
+    GpuMemory,
     Threads,
     Pid,
 }
 
 impl Column {
     /// The process list.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Name,
         Self::Cpu,
         Self::Memory,
         Self::Data,
         Self::Disk,
+        Self::Gpu,
+        Self::GpuMemory,
         Self::Threads,
         Self::Pid,
     ];
@@ -65,6 +72,8 @@ pub struct Totals {
     pub memory: f32,
     /// Bytes per second to and from storage.
     pub disk: f64,
+    /// Share of the busiest graphics card, where one reports it.
+    pub gpu: Option<f32>,
 }
 
 /// Written into the headings on the next view. A `Display` implementation has nowhere to take
@@ -73,6 +82,7 @@ static TOTALS: std::sync::RwLock<Totals> = std::sync::RwLock::new(Totals {
     cpu: 0.0,
     memory: 0.0,
     disk: 0.0,
+    gpu: None,
 });
 
 pub fn set_totals(totals: Totals) {
@@ -89,6 +99,7 @@ impl Column {
             Self::Cpu => Some(format!("{:.0}%", totals.cpu * 100.0)),
             Self::Memory => Some(format!("{:.0}%", totals.memory * 100.0)),
             Self::Disk => Some(rate(Some([totals.disk, 0.0]))),
+            Self::Gpu => totals.gpu.map(|gpu| format!("{:.0}%", gpu * 100.0)),
             _ => None,
         }
     }
@@ -114,6 +125,8 @@ impl Column {
             Self::Memory => fl!("column-memory"),
             Self::Data => fl!("column-data"),
             Self::Disk => fl!("column-disk"),
+            Self::Gpu => fl!("column-gpu"),
+            Self::GpuMemory => fl!("column-gpu-memory"),
             Self::Threads => fl!("column-threads"),
             Self::Pid => fl!("column-pid"),
         }
@@ -129,8 +142,8 @@ impl ItemCategory for Column {
             // Wide enough for "ssh " and an address, the longest of the four things this
             // column says.
             Self::Session => Length::Fixed(140.0),
-            Self::Cpu => Length::Fixed(60.0),
-            Self::Memory | Self::Data => Length::Fixed(92.0),
+            Self::Cpu | Self::Gpu => Length::Fixed(60.0),
+            Self::Memory | Self::Data | Self::GpuMemory => Length::Fixed(92.0),
             Self::Disk => Length::Fixed(96.0),
             Self::Threads => Length::Fixed(56.0),
             Self::Pid => Length::Fixed(60.0),
@@ -178,6 +191,8 @@ pub struct Row {
     memory: String,
     data: String,
     disk: String,
+    gpu: String,
+    gpu_memory: String,
     threads: String,
     pid: String,
 
@@ -186,6 +201,8 @@ pub struct Row {
     pub sort_memory: u64,
     pub sort_data: u64,
     pub sort_disk: f64,
+    pub sort_gpu: f32,
+    pub sort_gpu_memory: u64,
     pub sort_threads: u32,
     pub sort_pid: u32,
 }
@@ -193,9 +210,24 @@ pub struct Row {
 impl Row {
     /// One process.
     ///
-    /// Named by `comm`, the way the reference's details view names a process.
+    /// Named by `comm`, the way the reference's details view names a process. `gpu` is what
+    /// the graphics cards say of it: blank for a process that uses none, a dash for one whose
+    /// descriptors are closed to this user.
     #[must_use]
-    pub fn process(p: &Process) -> Self {
+    pub fn process(p: &Process, gpu: GpuUse) -> Self {
+        let (gpu_text, gpu_memory, sort_gpu, sort_gpu_memory) = match gpu {
+            GpuUse::None => (String::new(), String::new(), 0.0, 0),
+            GpuUse::Denied => (fl!("no-value"), fl!("no-value"), 0.0, 0),
+            GpuUse::Known(known) => (
+                known.busy.map(percent).unwrap_or_default(),
+                known
+                    .memory
+                    .map(|bytes| size(bytes / 1024))
+                    .unwrap_or_default(),
+                known.busy.unwrap_or(0.0),
+                known.memory.unwrap_or(0),
+            ),
+        };
         Self {
             kind: Kind::Process,
             pids: vec![p.pid],
@@ -207,12 +239,16 @@ impl Row {
             memory: size(p.rss),
             data: size(p.data),
             disk: rate(p.disk),
+            gpu: gpu_text,
+            gpu_memory,
             threads: p.threads.to_string(),
             pid: p.pid.to_string(),
             sort_cpu: p.cpu,
             sort_memory: p.rss,
             sort_data: p.data,
             sort_disk: p.disk.map_or(0.0, |d| d[0] + d[1]),
+            sort_gpu,
+            sort_gpu_memory,
             sort_threads: p.threads,
             sort_pid: p.pid,
         }
@@ -246,12 +282,17 @@ impl Row {
             memory: size(rss),
             data: size(data),
             disk: rate(disk),
+            // The users page has no graphics columns.
+            gpu: String::new(),
+            gpu_memory: String::new(),
             threads: threads.to_string(),
             pid: fl!("no-value"),
             sort_cpu: cpu,
             sort_memory: rss,
             sort_data: data,
             sort_disk: disk.map_or(0.0, |d| d[0] + d[1]),
+            sort_gpu: 0.0,
+            sort_gpu_memory: 0,
             sort_threads: threads,
             // Not shown on this page, and still the last tie-break of the sort: two logins
             // holding the same figures would otherwise swap places every second, because the
@@ -314,6 +355,8 @@ impl ItemInterface<Column> for Row {
             Column::Memory => self.memory.clone().into(),
             Column::Data => self.data.clone().into(),
             Column::Disk => self.disk.clone().into(),
+            Column::Gpu => self.gpu.clone().into(),
+            Column::GpuMemory => self.gpu_memory.clone().into(),
             Column::Threads => self.threads.clone().into(),
             Column::Pid => self.pid.clone().into(),
         }
@@ -352,6 +395,11 @@ fn by(a: &Row, b: &Row, category: Column) -> std::cmp::Ordering {
             .sort_disk
             .partial_cmp(&a.sort_disk)
             .unwrap_or(Ordering::Equal),
+        Column::Gpu => b
+            .sort_gpu
+            .partial_cmp(&a.sort_gpu)
+            .unwrap_or(Ordering::Equal),
+        Column::GpuMemory => b.sort_gpu_memory.cmp(&a.sort_gpu_memory),
         Column::Threads => b.sort_threads.cmp(&a.sort_threads),
         Column::Pid => a.sort_pid.cmp(&b.sort_pid),
     }
@@ -454,15 +502,44 @@ mod tests {
 
     /// PID is the one number column built smallest-first, the way the reference orders it.
     /// The arrow that describes the order is derived from this in app.rs and got it backwards.
+    /// A process that uses a card shows its share and memory, one that uses none is blank,
+    /// and one whose descriptors are closed reads as unknown - a dash, not a zero.
+    #[test]
+    fn the_gpu_columns_tell_unknown_from_unused() {
+        use crate::gpu::ProcessGpu;
+        let known = Row::process(
+            &Process::stub(10, 1, "player"),
+            GpuUse::Known(ProcessGpu {
+                busy: Some(0.42),
+                memory: Some(50 << 20),
+            }),
+        );
+        assert_eq!(known.get_text(Column::Gpu), percent(0.42));
+        assert_eq!(known.get_text(Column::GpuMemory), size(50 << 10));
+        let unused = Row::process(&Process::stub(20, 1, "shell"), GpuUse::None);
+        assert_eq!(unused.get_text(Column::Gpu), "");
+        let closed = Row::process(&Process::stub(30, 1, "daemon"), GpuUse::Denied);
+        assert_eq!(closed.get_text(Column::Gpu), fl!("no-value"));
+        // Busiest first, as every number column sorts.
+        assert_eq!(
+            compare(&known, &unused, Column::Gpu),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare(&known, &unused, Column::GpuMemory),
+            std::cmp::Ordering::Less
+        );
+    }
+
     #[test]
     fn pid_sorts_smallest_first_unlike_every_other_number() {
-        let a = Row::process(&Process::stub(10, 1, "a"));
-        let b = Row::process(&Process::stub(20, 1, "b"));
+        let a = Row::process(&Process::stub(10, 1, "a"), GpuUse::None);
+        let b = Row::process(&Process::stub(20, 1, "b"), GpuUse::None);
         assert_eq!(compare(&a, &b, Column::Pid), std::cmp::Ordering::Less);
 
         // Memory, for contrast: the bigger number comes first.
-        let mut big = Row::process(&Process::stub(30, 1, "c"));
-        let mut small = Row::process(&Process::stub(40, 1, "d"));
+        let mut big = Row::process(&Process::stub(30, 1, "c"), GpuUse::None);
+        let mut small = Row::process(&Process::stub(40, 1, "d"), GpuUse::None);
         big.sort_memory = 100;
         small.sort_memory = 1;
         assert_eq!(
