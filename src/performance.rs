@@ -7,7 +7,7 @@
 //! is left, and the facts panel down the right. Nothing is drawn under the tiles - the
 //! per-core switch lives in the graph's context menu, as it does in the reference.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use cosmic::iced::widget::canvas;
@@ -191,22 +191,63 @@ fn rings() -> Rings {
     std::array::from_fn(|i| Ring::new(Kind::ALL[i].bands().len(), WINDOW))
 }
 
-/// One graphics card's histories: how busy it is, how full its own memory is, and how much
-/// of the machine's memory it holds. All three are `Kind::Gpu`, so all three take the card's
-/// colour.
+/// One graphics card's histories: how busy it is, how hot, how full its own memory is, and
+/// how much of the machine's memory it holds. All four are `Kind::Gpu`, so all four take the
+/// card's colour.
 struct GpuHistory {
     busy: Rings,
+    /// Redrawn from `celsius` every tick, as a share of `temperature_top`.
+    temperature: Rings,
     dedicated: Rings,
     shared: Rings,
+    /// The last minute of temperatures in degrees, oldest first.
+    celsius: VecDeque<f32>,
+    /// The top of the temperature scale, in degrees.
+    temperature_top: f32,
 }
 
 impl GpuHistory {
     fn new() -> Self {
         Self {
             busy: rings(),
+            temperature: rings(),
             dedicated: rings(),
             shared: rings(),
+            celsius: VecDeque::with_capacity(WINDOW),
+            temperature_top: TEMPERATURE_TOP,
         }
+    }
+
+    /// Takes a temperature in, and redraws the graph against the scale the window now needs.
+    ///
+    /// The scale moves with the window, so every column already in the ring would be drawn
+    /// against the wrong top: the ring is refilled from the degrees rather than appended to.
+    fn push_temperature(&mut self, celsius: f32) {
+        if self.celsius.len() == WINDOW {
+            self.celsius.pop_front();
+        }
+        self.celsius.push_back(celsius);
+        self.temperature_top = temperature_top(self.celsius.iter().copied());
+        let gpu = Kind::Gpu.index();
+        self.temperature[gpu] = Ring::new(Kind::Gpu.bands().len(), WINDOW);
+        for celsius in &self.celsius {
+            self.temperature[gpu].push(&[(celsius / self.temperature_top).clamp(0.0, 1.0)]);
+        }
+    }
+}
+
+/// The temperature scale stops at a hundred degrees, where no card in normal work goes.
+const TEMPERATURE_TOP: f32 = 100.0;
+
+/// The top of the temperature scale for a window of readings: a hundred degrees, or past it
+/// the hottest reading rounded up to whole tens - 103 draws against 110. Back to a hundred
+/// once the hot readings have left the window.
+fn temperature_top(celsius: impl IntoIterator<Item = f32>) -> f32 {
+    let peak = celsius.into_iter().fold(0.0_f32, f32::max);
+    if peak <= TEMPERATURE_TOP {
+        TEMPERATURE_TOP
+    } else {
+        (peak / 10.0).ceil() * 10.0
     }
 }
 
@@ -392,6 +433,9 @@ impl Performance {
             if let Some(busy) = card.busy {
                 history.busy[gpu].push(&[busy]);
             }
+            if let Some(celsius) = card.temperature {
+                history.push_temperature(celsius);
+            }
             if let Some((used, total)) = card.memory {
                 history.dedicated[gpu].push(&[share(used, total)]);
             }
@@ -424,9 +468,9 @@ impl Performance {
             self.cores.clear();
         }
 
-        // The large plot, a thumbnail per rail row, a tile per core, and a graphics card's two
-        // memory graphs last.
-        let needed = 1 + self.devices.len() + self.cores.len() + 2;
+        // The large plot, a thumbnail per rail row, a tile per core, and a graphics card's
+        // temperature and two memory graphs last.
+        let needed = 1 + self.devices.len() + self.cores.len() + 3;
         while self.caches.len() < needed {
             self.caches.push(canvas::Cache::new());
         }
@@ -596,7 +640,7 @@ impl Performance {
             main = main.push(self.memory_panel());
         }
         if let Device::Gpu(i) = self.device {
-            for element in self.gpu_memory_graphs(i) {
+            for element in self.gpu_graphs(i) {
                 main = main.push(element);
             }
         }
@@ -763,11 +807,11 @@ impl Performance {
         column.push(list).into()
     }
 
-    /// Under a card's utilization graph: its own memory, then its share of the machine's,
-    /// each with its label and its scale above it, and each only where the driver reports it.
-    /// An Intel card has no memory of its own and NVML does not report shared memory, so
-    /// either may be missing.
-    fn gpu_memory_graphs(&self, i: usize) -> Vec<Element<'_, Message>> {
+    /// Under a card's utilization graph: its temperature, its own memory, then its share of the
+    /// machine's - the order of the facts column - each with its label and its scale above it,
+    /// and each only where the driver reports it. An Intel card has no sensor and no memory of
+    /// its own, and NVML does not report shared memory, so any of them may be missing.
+    fn gpu_graphs(&self, i: usize) -> Vec<Element<'_, Message>> {
         let (Some(card), Some(history)) = (self.gpus.cards().get(i), self.gpu_history.get(i))
         else {
             return Vec::new();
@@ -775,18 +819,28 @@ impl Performance {
         let first = 1 + self.devices.len() + self.cores.len();
         let graphs = [
             (
+                fl!("fact-gpu-temperature"),
+                card.temperature.map(|_| {
+                    fl!(
+                        "temperature-c",
+                        value = format!("{:.0}", history.temperature_top)
+                    )
+                }),
+                &history.temperature,
+            ),
+            (
                 fl!("fact-gpu-memory"),
-                card.memory.map(|(_, total)| total),
+                card.memory.map(|(_, total)| size(total)),
                 &history.dedicated,
             ),
             (
                 fl!("fact-gpu-shared"),
                 card.shared
-                    .map(|(_, limit)| limit.unwrap_or(self.last.mem_total)),
+                    .map(|(_, limit)| size(limit.unwrap_or(self.last.mem_total))),
                 &history.shared,
             ),
         ];
-        let mut out = Vec::with_capacity(4);
+        let mut out = Vec::with_capacity(6);
         for (n, (label, top, history)) in graphs.into_iter().enumerate() {
             let Some(top) = top else {
                 continue;
@@ -795,7 +849,7 @@ impl Performance {
                 widget::row::with_capacity(3)
                     .push(widget::text::caption(label))
                     .push(widget::Space::new().width(Length::Fill))
-                    .push(widget::text::caption(size(top)))
+                    .push(widget::text::caption(top))
                     .into(),
             );
             out.push(self.plot(
@@ -1597,6 +1651,33 @@ mod tests {
         assert_eq!(rows(&intel), [vec![Utilization, SharedMemory]]);
 
         assert_eq!(rows(&Card::bare()), [vec![Utilization]]);
+    }
+
+    /// A hundred degrees until a reading passes it, then the hottest reading in whole tens.
+    #[test]
+    fn the_temperature_scale_grows_past_a_hundred() {
+        assert_eq!(temperature_top([34.0]), 100.0);
+        assert_eq!(temperature_top([34.0, 100.0]), 100.0);
+        assert_eq!(temperature_top([34.0, 103.0, 60.0]), 110.0);
+        assert_eq!(temperature_top([120.0]), 120.0);
+        assert_eq!(temperature_top([]), 100.0);
+    }
+
+    /// The graph is redrawn against the scale the whole window needs, and drops back to a
+    /// hundred once the hot reading has scrolled out.
+    #[test]
+    fn a_hot_minute_rescales_the_whole_graph() {
+        let mut history = GpuHistory::new();
+        history.push_temperature(50.0);
+        history.push_temperature(110.0);
+        assert_eq!(history.temperature_top, 110.0);
+        assert_eq!(history.celsius.len(), 2);
+
+        for _ in 0..WINDOW {
+            history.push_temperature(40.0);
+        }
+        assert_eq!(history.celsius.len(), WINDOW);
+        assert_eq!(history.temperature_top, 100.0);
     }
 
     /// A memory graph is a share of its limit, and never leaves the scale: a counter read
