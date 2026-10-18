@@ -133,6 +133,16 @@ fact-gpu-fan = Fan:
 clock-mhz = { $value } MHz
 power-w = { $value } W
 fan-rpm = { $value } RPM
+# Engines of a graphics card, as its driver classes them.
+engine-3d = 3D
+engine-compute = Compute
+engine-copy = Copy
+engine-video = Video
+engine-video-enhance = Video processing
+engine-decode = Video decode
+engine-encode = Video encode
+engine-encode-2 = Video encode 2
+engine-jpeg = JPEG
 fact-gpu-chip = Chip:
 fact-gpu-driver = Driver:
 fact-gpu-node = Node:

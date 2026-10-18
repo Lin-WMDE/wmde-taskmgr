@@ -19,6 +19,7 @@
 //! one - is listed with its name and no reading. Nothing here needs root or starts a
 //! process: `nvidia-smi` would cost a process every tick.
 
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr, c_char, c_int, c_uint, c_void};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -59,11 +60,31 @@ pub struct Card {
     /// Watts drawn, and the limit the card is held to where the driver says.
     pub power: Option<(f32, Option<f32>)>,
     pub fan: Option<Fan>,
+    /// How busy each engine was over the last interval, by the driver's class name -
+    /// `render`, `video`, `gfx`, `dec`. Empty on the first tick of a walk and for a card that
+    /// reports none.
+    pub engines: Vec<Engine>,
     source: Source,
     /// The card's `hwmon` temperature input, found once at start-up.
     thermal: Option<PathBuf>,
     /// Where the rest of its sensors are, found once at start-up.
     sensors: Sensors,
+}
+
+/// One engine class of a card and the share of the interval it was busy, `0.0..=1.0`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Engine {
+    pub class: Box<str>,
+    pub busy: f32,
+}
+
+/// What one process asks of the graphics cards, as of the last tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProcessGpu {
+    /// The busiest engine it used, as a share; the reference's "GPU" column.
+    pub busy: Option<f32>,
+    /// Bytes its clients hold, in every memory region.
+    pub memory: Option<u64>,
 }
 
 /// How fast a card's fan turns: NVML says it as a share of the fan's top speed, `hwmon` in
@@ -115,6 +136,12 @@ pub struct Gpus {
     buf: Vec<u8>,
     /// Where the DRM clients' `fdinfo` is read from: `/proc`, or a test's stand-in for it.
     proc: PathBuf,
+    /// Each client's engine counters at the last walk, by card, client and engine class.
+    engine_prev: HashMap<(String, u64, String), u64>,
+    /// When the last walk was.
+    walked_at: Option<Instant>,
+    /// Each process's use of the cards, by pid.
+    processes: HashMap<u32, ProcessGpu>,
 }
 
 impl Gpus {
@@ -172,6 +199,7 @@ impl Gpus {
                 clocks: (None, None),
                 power: None,
                 fan: None,
+                engines: Vec::new(),
                 source,
                 thermal,
                 sensors,
@@ -197,7 +225,16 @@ impl Gpus {
             nvml,
             buf: Vec::with_capacity(32),
             proc: PathBuf::from(PROC_DIR),
+            engine_prev: HashMap::new(),
+            walked_at: None,
+            processes: HashMap::new(),
         }
+    }
+
+    /// What each process asked of the cards over the last tick, by pid. A process with no
+    /// client of a card is absent.
+    pub fn processes(&self) -> &HashMap<u32, ProcessGpu> {
+        &self.processes
     }
 
     /// Reads every card's counters. `now` is taken by the caller, so a test can drive the
@@ -208,7 +245,11 @@ impl Gpus {
             nvml,
             buf,
             proc,
+            engine_prev,
+            walked_at,
+            processes,
         } = self;
+        processes.clear();
         for card in cards.iter_mut() {
             match &mut card.source {
                 Source::None => {}
@@ -251,6 +292,18 @@ impl Gpus {
                 card.clocks = nvml.clocks(*handle);
                 card.power = nvml.power(*handle);
                 card.fan = nvml.fan(*handle).map(Fan::Percent);
+                card.engines = [
+                    ("dec", nvml.decoder(*handle)),
+                    ("enc", nvml.encoder(*handle)),
+                ]
+                .into_iter()
+                .filter_map(|(class, busy)| {
+                    Some(Engine {
+                        class: class.into(),
+                        busy: busy?,
+                    })
+                })
+                .collect();
             } else {
                 let sensors = &card.sensors;
                 let mut read = |path: &Option<PathBuf>| read_u64(path.as_deref()?, buf);
@@ -271,18 +324,125 @@ impl Gpus {
             }
         }
 
-        // An Intel card's share of the machine's memory has no counter of its own; it is
-        // what its clients hold. Walked only when there is such a card to ask about.
-        if cards.iter().any(is_intel) {
-            let held = drm_memory(proc, buf);
-            for card in cards.iter_mut().filter(|card| is_intel(card)) {
-                card.shared = held
+        // Everything a card without NVML says about its clients - an Intel card's share of
+        // the machine's memory, every card's engines, each process's use - is in its
+        // clients' fdinfo, read in one walk. Walked only when there is such a card.
+        if !cards.iter().any(walks) {
+            return;
+        }
+        let clients = drm_clients(proc, buf);
+        let elapsed = walked_at
+            .map(|at| now.saturating_duration_since(at).as_nanos() as f64)
+            .filter(|ns| *ns > 0.0);
+        *walked_at = Some(now);
+        let usage = account(&clients, engine_prev);
+
+        for card in cards.iter_mut().filter(|card| walks(card)) {
+            if is_intel(card) {
+                card.shared = usage.shared.get(&*card.address).map(|bytes| (*bytes, None));
+            }
+            let mut engines: Vec<Engine> = match elapsed {
+                Some(ns) => usage
+                    .card_busy
                     .iter()
-                    .find(|(pdev, _)| **pdev == *card.address)
-                    .map(|(_, bytes)| (*bytes, None));
+                    .filter(|((pdev, _), _)| *pdev == &*card.address)
+                    .map(|((pdev, class), busy)| Engine {
+                        class: (*class).into(),
+                        busy: busy_share(*busy, ns, usage.capacity(pdev, class)),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            engines.sort_by(|a, b| a.class.cmp(&b.class));
+            card.engines = engines;
+        }
+
+        for (pid, held) in &usage.held {
+            processes.entry(*pid).or_default().memory = Some(*held);
+        }
+        if let Some(ns) = elapsed {
+            for ((pid, pdev, class), busy) in &usage.pid_busy {
+                let share = busy_share(*busy, ns, usage.capacity(pdev, class));
+                let entry = &mut processes.entry(*pid).or_default().busy;
+                *entry = Some(entry.map_or(share, |seen: f32| seen.max(share)));
             }
         }
     }
+}
+
+/// A card whose clients are read from fdinfo: every card on a driver but NVIDIA's, which
+/// publishes nothing there and is asked through NVML instead.
+fn walks(card: &Card) -> bool {
+    !card.driver.is_empty() && &*card.driver != "nvidia"
+}
+
+/// The share of an interval of `elapsed_ns` an engine class was busy, with `busy_ns` summed
+/// over its clients and `capacity` engines of the class to spread it over.
+fn busy_share(busy_ns: u64, elapsed_ns: f64, capacity: u32) -> f32 {
+    (busy_ns as f64 / (elapsed_ns * f64::from(capacity.max(1)))).clamp(0.0, 1.0) as f32
+}
+
+/// One walk's clients turned into what the cards and the processes did since the last.
+struct Usage<'a> {
+    /// Card address -> system memory its clients hold.
+    shared: HashMap<&'a str, u64>,
+    /// (card, engine class) -> nanoseconds busy since the last walk, over every client.
+    card_busy: HashMap<(&'a str, &'a str), u64>,
+    /// (pid, card, engine class) -> the same, over the clients of one process.
+    pid_busy: HashMap<(u32, &'a str, &'a str), u64>,
+    /// pid -> bytes its clients hold in every region.
+    held: HashMap<u32, u64>,
+    /// (card, engine class) -> engines of the class, where a client said.
+    capacity: HashMap<(&'a str, &'a str), u32>,
+}
+
+impl Usage<'_> {
+    fn capacity(&self, pdev: &str, class: &str) -> u32 {
+        self.capacity.get(&(pdev, class)).copied().unwrap_or(1)
+    }
+}
+
+/// Sums one walk's clients, and swaps `prev` for this walk's engine counters.
+///
+/// A client seen for the first time counts as idle - there is nothing to take its counters
+/// against - and a client gone since the last walk simply drops out: neither can make a
+/// share go below nothing.
+fn account<'a>(
+    clients: &'a [(u32, Client)],
+    prev: &mut HashMap<(String, u64, String), u64>,
+) -> Usage<'a> {
+    let mut usage = Usage {
+        shared: HashMap::new(),
+        card_busy: HashMap::new(),
+        pid_busy: HashMap::new(),
+        held: HashMap::new(),
+        capacity: HashMap::new(),
+    };
+    let mut next = HashMap::with_capacity(prev.len());
+    for (pid, client) in clients {
+        let pdev = client.pdev.as_str();
+        if let Some(bytes) = client.memory {
+            *usage.shared.entry(pdev).or_default() += bytes;
+        }
+        if let Some(bytes) = client.held {
+            *usage.held.entry(*pid).or_default() += bytes;
+        }
+        for (class, engines) in &client.capacity {
+            usage.capacity.insert((pdev, class.as_str()), *engines);
+        }
+        for (class, ns) in &client.engines {
+            let key = (client.pdev.clone(), client.id, class.clone());
+            let delta = prev.get(&key).map_or(0, |seen| ns.saturating_sub(*seen));
+            *usage.card_busy.entry((pdev, class.as_str())).or_default() += delta;
+            *usage
+                .pid_busy
+                .entry((*pid, pdev, class.as_str()))
+                .or_default() += delta;
+            next.insert(key, *ns);
+        }
+    }
+    *prev = next;
+    usage
 }
 
 #[cfg(test)]
@@ -302,6 +462,7 @@ impl Card {
             clocks: (None, None),
             power: None,
             fan: None,
+            engines: Vec::new(),
             source: Source::None,
             thermal: None,
             sensors: Sensors::default(),
@@ -466,6 +627,12 @@ struct Client {
     /// System memory held, in bytes, with a buffer shared with another client counted at
     /// half. `None` when the kernel reports no memory regions.
     memory: Option<u64>,
+    /// Bytes resident in every region, the card's own included: what the process holds.
+    held: Option<u64>,
+    /// Nanoseconds each engine class has been busy for this client since it opened the card.
+    engines: Vec<(String, u64)>,
+    /// Engines of a class, where the driver has more than one: `drm-engine-capacity-*`.
+    capacity: Vec<(String, u32)>,
 }
 
 /// Reads a DRM client's `fdinfo`. `None` for a descriptor that is not a DRM client.
@@ -478,6 +645,9 @@ fn parse_fdinfo(text: &str) -> Option<Client> {
     let mut pdev = None;
     let mut id = None;
     let (mut resident, mut shared, mut reported) = (0_u64, 0_u64, false);
+    let mut held = None;
+    let mut engines = Vec::new();
+    let mut capacity = Vec::new();
     for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -487,6 +657,25 @@ fn parse_fdinfo(text: &str) -> Option<Client> {
             "drm-pdev" => pdev = Some(value.to_owned()),
             "drm-client-id" => id = value.parse().ok(),
             _ => {
+                // Engines first: `drm-engine-capacity-` begins with `drm-engine-` too.
+                if let Some(class) = key.strip_prefix("drm-engine-capacity-") {
+                    if let Ok(count) = value.parse() {
+                        capacity.push((class.to_owned(), count));
+                    }
+                    continue;
+                }
+                if let Some(class) = key.strip_prefix("drm-engine-") {
+                    let ns = value.strip_suffix("ns").unwrap_or(value).trim();
+                    if let Ok(ns) = ns.parse() {
+                        engines.push((class.to_owned(), ns));
+                    }
+                    continue;
+                }
+                if key.starts_with("drm-resident-")
+                    && let Some(bytes) = parse_size(value)
+                {
+                    *held.get_or_insert(0) += bytes;
+                }
                 let (into, region) = if let Some(region) = key.strip_prefix("drm-resident-") {
                     (&mut resident, region)
                 } else if let Some(region) = key.strip_prefix("drm-shared-") {
@@ -508,6 +697,9 @@ fn parse_fdinfo(text: &str) -> Option<Client> {
         pdev: pdev?,
         id: id?,
         memory: reported.then(|| resident.saturating_sub(shared / 2)),
+        held,
+        engines,
+        capacity,
     })
 }
 
@@ -525,21 +717,23 @@ fn parse_size(value: &str) -> Option<u64> {
     Some(number.saturating_mul(scale))
 }
 
-/// System memory DRM clients hold, per card address, summed over every process whose
-/// descriptors this user may read.
+/// Every DRM client of every process whose descriptors this user may read, with the pid
+/// that holds it.
 ///
 /// Only descriptors that point into `/dev/dri/` have their `fdinfo` read; the rest cost one
 /// `readlink`. A client is counted once however many descriptors it has open. A card none of
 /// whose clients reports memory is left out, so it reads as having no source rather than as
 /// holding nothing.
-fn drm_memory(proc: &Path, buf: &mut Vec<u8>) -> Vec<(String, u64)> {
-    let mut seen: Vec<(String, u64)> = Vec::new();
-    let mut held: Vec<(String, u64)> = Vec::new();
+fn drm_clients(proc: &Path, buf: &mut Vec<u8>) -> Vec<(u32, Client)> {
+    let mut clients: Vec<(u32, Client)> = Vec::new();
     for process in std::fs::read_dir(proc).into_iter().flatten().flatten() {
-        let pid = process.file_name();
-        if !pid.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
             continue;
-        }
+        };
         let dir = process.path();
         let Ok(fds) = std::fs::read_dir(dir.join("fd")) else {
             continue;
@@ -554,21 +748,18 @@ fn drm_memory(proc: &Path, buf: &mut Vec<u8>) -> Vec<(String, u64)> {
             let Some(client) = read_client(&dir, &fd.file_name(), buf) else {
                 continue;
             };
-            let key = (client.pdev, client.id);
-            if seen.contains(&key) {
+            // Counted once, for the first process seen holding it: a client a parent
+            // passed to its child is one client.
+            if clients
+                .iter()
+                .any(|(_, seen)| seen.pdev == client.pdev && seen.id == client.id)
+            {
                 continue;
             }
-            let (pdev, _) = &key;
-            if let Some(bytes) = client.memory {
-                match held.iter_mut().find(|(at, _)| at == pdev) {
-                    Some((_, sum)) => *sum += bytes,
-                    None => held.push((pdev.clone(), bytes)),
-                }
-            }
-            seen.push(key);
+            clients.push((pid, client));
         }
     }
-    held
+    clients
 }
 
 fn read_client(process: &Path, fd: &OsStr, buf: &mut Vec<u8>) -> Option<Client> {
@@ -648,6 +839,8 @@ struct Nvml {
     power_limit: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
     clock_info: Option<unsafe extern "C" fn(NvmlDevice, c_uint, *mut c_uint) -> c_int>,
     fan_speed: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
+    decoder: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> c_int>,
+    encoder: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> c_int>,
     /// Last, so it is dropped after the functions taken from it.
     _lib: libloading::Library,
 }
@@ -694,6 +887,14 @@ impl Nvml {
                 .get(b"nvmlDeviceGetFanSpeed\0")
                 .ok()
                 .map(|symbol| *symbol);
+            let decoder = lib
+                .get(b"nvmlDeviceGetDecoderUtilization\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let encoder = lib
+                .get(b"nvmlDeviceGetEncoderUtilization\0")
+                .ok()
+                .map(|symbol| *symbol);
             let rc = init();
             if rc != NVML_SUCCESS {
                 tracing::warn!(
@@ -713,6 +914,8 @@ impl Nvml {
                 power_limit,
                 clock_info,
                 fan_speed,
+                decoder,
+                encoder,
                 _lib: lib,
             })
         }
@@ -788,6 +991,27 @@ impl Nvml {
             (rc == NVML_SUCCESS).then_some(mhz)
         };
         (clock(NVML_CLOCK_GRAPHICS), clock(NVML_CLOCK_MEM))
+    }
+
+    /// How busy the video decoder was, as a share.
+    fn decoder(&self, device: usize) -> Option<f32> {
+        Self::codec(self.decoder, device)
+    }
+
+    /// How busy the video encoder was, as a share.
+    fn encoder(&self, device: usize) -> Option<f32> {
+        Self::codec(self.encoder, device)
+    }
+
+    fn codec(
+        call: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint, *mut c_uint) -> c_int>,
+        device: usize,
+    ) -> Option<f32> {
+        let call = call?;
+        let (mut percent, mut period_us): (c_uint, c_uint) = (0, 0);
+        // SAFETY: a handle NVML gave out and places for the share and its sampling period.
+        let rc = unsafe { call(device as NvmlDevice, &mut percent, &mut period_us) };
+        (rc == NVML_SUCCESS).then(|| percent.min(100) as f32 / 100.0)
     }
 
     /// The fan as a share of its top speed, in percent.
@@ -1084,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_intel_card_has_its_clients_counted() {
+    fn only_an_intel_card_reports_shared_memory() {
         let sys = Sysfs::new("fdinfo-other");
         sys.card("card0", "0000:00:02.0", "0x030000", "vmwgfx");
         sys.descriptor(
@@ -1205,6 +1429,95 @@ mod tests {
         let mut gpus = Gpus::scan(&sys.drm(), || None);
         gpus.sample(Instant::now());
         assert_eq!(gpus.cards()[0].temperature, None);
+    }
+
+    #[test]
+    fn a_client_reports_its_engines() {
+        let client = parse_fdinfo(
+            "drm-client-id:\t7\ndrm-pdev:\t0000:00:02.0\n\
+             drm-engine-render:\t500000000 ns\ndrm-engine-video:\t0 ns\n\
+             drm-engine-capacity-video:\t2\ndrm-resident-system0:\t4 MiB\n\
+             drm-resident-local0:\t1 MiB\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client.engines,
+            [("render".to_owned(), 500_000_000), ("video".to_owned(), 0)]
+        );
+        assert_eq!(client.capacity, [("video".to_owned(), 2)]);
+        // Every region for the process, the card's own included; system memory only for the
+        // card's share of the machine's.
+        assert_eq!(client.held, Some(5 << 20));
+        assert_eq!(client.memory, Some(4 << 20));
+    }
+
+    /// Two walks a second apart: render busy half of it, two video engines busy one second
+    /// between them - also half - and the busier engine is the process's figure.
+    #[test]
+    fn engines_and_processes_are_shares_of_the_interval() {
+        let sys = Sysfs::new("engines");
+        sys.card("card1", "0000:00:02.0", "0x030000", "i915");
+        let info = |render: u64, video: u64| {
+            format!(
+                "drm-client-id:\t7\ndrm-pdev:\t0000:00:02.0\n\
+                 drm-engine-render:\t{render} ns\ndrm-engine-video:\t{video} ns\n\
+                 drm-engine-capacity-video:\t2\ndrm-resident-system0:\t8 MiB\n"
+            )
+        };
+        sys.descriptor(500, 3, "/dev/dri/renderD128", &info(0, 0));
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        let start = Instant::now();
+        gpus.sample(start);
+        assert!(
+            gpus.cards()[0].engines.is_empty(),
+            "one walk is not an interval"
+        );
+        assert_eq!(gpus.processes()[&500].memory, Some(8 << 20));
+
+        fs::write(
+            sys.proc().join("500/fdinfo/3"),
+            info(500_000_000, 1_000_000_000),
+        )
+        .unwrap();
+        gpus.sample(start + Duration::from_secs(1));
+        let engines = &gpus.cards()[0].engines;
+        assert_eq!(
+            engines,
+            &[
+                Engine {
+                    class: "render".into(),
+                    busy: 0.5
+                },
+                Engine {
+                    class: "video".into(),
+                    busy: 0.5
+                },
+            ]
+        );
+        assert_eq!(gpus.processes()[&500].busy, Some(0.5));
+    }
+
+    /// A client that closed the card between two walks drops out; nothing goes below zero.
+    #[test]
+    fn a_client_gone_between_walks_counts_nothing() {
+        let sys = Sysfs::new("engines-gone");
+        sys.card("card1", "0000:00:02.0", "0x030000", "i915");
+        let info = |id: u32, render: u64| {
+            format!(
+                "drm-client-id:\t{id}\ndrm-pdev:\t0000:00:02.0\ndrm-engine-render:\t{render} ns\n"
+            )
+        };
+        sys.descriptor(500, 3, "/dev/dri/renderD128", &info(7, 900_000_000));
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        let start = Instant::now();
+        gpus.sample(start);
+
+        // Client 7 is gone, client 8 is new: neither has an interval yet.
+        fs::write(sys.proc().join("500/fdinfo/3"), info(8, 100_000_000)).unwrap();
+        gpus.sample(start + Duration::from_secs(1));
+        assert_eq!(gpus.cards()[0].engines[0].busy, 0.0);
     }
 
     #[test]

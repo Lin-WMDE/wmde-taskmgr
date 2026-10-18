@@ -41,6 +41,15 @@ const GRID_COLS: u16 = 6;
 const GRID_ROWS: u16 = 10;
 
 const PLOT_HEIGHT: f32 = 240.0;
+/// A graphics card's utilization graph: two thirds of the others, so that its engines, its
+/// temperature and its memory fit under it in a window of the default size. The page cannot
+/// scroll instead - a `responsive` plot inside a `scrollable` takes every click in the window.
+const GPU_PLOT_HEIGHT: f32 = PLOT_HEIGHT * 2.0 / 3.0;
+/// A graphics card's small graphs: engines, temperature, memory.
+const GPU_SMALL_HEIGHT: f32 = 64.0;
+/// Engine graphs to a row, and the columns of their grid at the quarter width each has.
+const ENGINES_PER_ROW: usize = 4;
+const ENGINE_GRID_COLS: u16 = 3;
 /// A graphics card's memory graphs, under its utilization graph: a third of its height.
 const MEMORY_PLOT_HEIGHT: f32 = PLOT_HEIGHT / 3.0;
 /// Rows of their grid: a quarter of the scale each, at a cell close to the large plot's shape.
@@ -202,6 +211,8 @@ fn rings() -> Rings {
 /// card's colour.
 struct GpuHistory {
     busy: Rings,
+    /// One per engine class the card has reported, in the order first seen.
+    engines: Vec<(Box<str>, Rings)>,
     /// Redrawn from `celsius` every tick, as a share of `temperature_top`.
     temperature: Rings,
     dedicated: Rings,
@@ -216,6 +227,7 @@ impl GpuHistory {
     fn new() -> Self {
         Self {
             busy: rings(),
+            engines: Vec::new(),
             temperature: rings(),
             dedicated: rings(),
             shared: rings(),
@@ -477,6 +489,27 @@ impl Performance {
             if let Some(busy) = card.busy {
                 history.busy[gpu].push(&[busy]);
             }
+            // An engine reported once keeps its graph: a class with no client this tick was
+            // idle, and is drawn so.
+            if !card.engines.is_empty() {
+                for engine in &card.engines {
+                    if !history
+                        .engines
+                        .iter()
+                        .any(|(class, _)| **class == *engine.class)
+                    {
+                        history.engines.push((engine.class.clone(), rings()));
+                    }
+                }
+                for (class, set) in &mut history.engines {
+                    let busy = card
+                        .engines
+                        .iter()
+                        .find(|engine| engine.class == *class)
+                        .map_or(0.0, |engine| engine.busy);
+                    set[gpu].push(&[busy]);
+                }
+            }
             if let Some(celsius) = card.temperature {
                 history.push_temperature(celsius);
             }
@@ -515,8 +548,14 @@ impl Performance {
         }
 
         // The large plot, a thumbnail per rail row, a tile per core, and the small graphs of
-        // the page last: a graphics card's three, a disk's one.
-        let needed = 1 + self.devices.len() + self.cores.len() + 3;
+        // the page last: a graphics card's three and its engines, a disk's one.
+        let engines = self
+            .gpu_history
+            .iter()
+            .map(|history| history.engines.len())
+            .max()
+            .unwrap_or(0);
+        let needed = 1 + self.devices.len() + self.cores.len() + 3 + engines;
         while self.caches.len() < needed {
             self.caches.push(canvas::Cache::new());
         }
@@ -668,7 +707,11 @@ impl Performance {
                     self.device.kind(),
                     self.rings_of(self.device),
                     0,
-                    PLOT_HEIGHT,
+                    if matches!(self.device, Device::Gpu(_)) {
+                        GPU_PLOT_HEIGHT
+                    } else {
+                        PLOT_HEIGHT
+                    },
                     graph_style(self.device.kind(), GRID_COLS, GRID_ROWS),
                     None,
                 )
@@ -895,7 +938,8 @@ impl Performance {
                 &history.shared,
             ),
         ];
-        let mut out = Vec::with_capacity(6);
+        let mut out = Vec::with_capacity(8);
+        out.extend(self.engine_rows(card, history, first + graphs.len()));
         for (n, (label, top, history)) in graphs.into_iter().enumerate() {
             let Some(top) = top else {
                 continue;
@@ -911,7 +955,7 @@ impl Performance {
                 Kind::Gpu,
                 history,
                 first + n,
-                MEMORY_PLOT_HEIGHT,
+                GPU_SMALL_HEIGHT,
                 Style::Curve {
                     cols: GRID_COLS,
                     rows: MEMORY_GRID_ROWS,
@@ -920,6 +964,64 @@ impl Performance {
             ));
         }
         out
+    }
+
+    /// A card's engines, `ENGINES_PER_ROW` graphs to a row in a fixed order - 3D, compute,
+    /// copy, the video engines - each with its name and its share now above it.
+    fn engine_rows<'a>(
+        &'a self,
+        card: &'a Card,
+        history: &'a GpuHistory,
+        cache: usize,
+    ) -> Vec<Element<'a, Message>> {
+        let spacing = cosmic::theme::spacing();
+        let mut order: Vec<usize> = (0..history.engines.len()).collect();
+        order.sort_by_key(|&n| engine_rank(&history.engines[n].0));
+        order
+            .chunks(ENGINES_PER_ROW)
+            .map(|chunk| {
+                let mut row = widget::row::with_capacity(ENGINES_PER_ROW)
+                    .spacing(spacing.space_xxs)
+                    .width(Length::Fill);
+                for slot in 0..ENGINES_PER_ROW {
+                    let Some(&n) = chunk.get(slot) else {
+                        // The last row is padded, not stretched: a card with five engines
+                        // does not draw its fifth four times as wide.
+                        row = row.push(widget::Space::new().width(Length::FillPortion(1)));
+                        continue;
+                    };
+                    let (class, rings) = &history.engines[n];
+                    let now = card
+                        .engines
+                        .iter()
+                        .find(|engine| engine.class == *class)
+                        .map_or_else(|| fl!("no-value"), |engine| percent(engine.busy));
+                    let tile = widget::column::with_capacity(2)
+                        .push(
+                            widget::row::with_capacity(3)
+                                .push(
+                                    widget::text::caption(engine_label(class))
+                                        .wrapping(Wrapping::None),
+                                )
+                                .push(widget::Space::new().width(Length::Fill))
+                                .push(widget::text::caption(now).wrapping(Wrapping::None)),
+                        )
+                        .push(self.plot(
+                            Kind::Gpu,
+                            rings,
+                            cache + n,
+                            GPU_SMALL_HEIGHT,
+                            Style::Curve {
+                                cols: ENGINE_GRID_COLS,
+                                rows: MEMORY_GRID_ROWS,
+                            },
+                            None,
+                        ));
+                    row = row.push(widget::container(tile).width(Length::FillPortion(1)));
+                }
+                row.into()
+            })
+            .collect()
     }
 
     /// Shows `device`, and reads a network card's details straight away rather than leaving
@@ -1695,6 +1797,39 @@ impl Performance {
     }
 }
 
+/// Where an engine class goes among a card's engines: the reference's order, 3D first.
+fn engine_rank(class: &str) -> (u8, &str) {
+    let rank = match class {
+        "render" | "gfx" => 0,
+        "compute" => 1,
+        "copy" | "dma" => 2,
+        "video" => 3,
+        "video-enhance" | "vpe" => 4,
+        "dec" => 5,
+        "enc" => 6,
+        "enc_1" => 7,
+        "jpeg" => 8,
+        _ => 9,
+    };
+    (rank, class)
+}
+
+/// What to call an engine class. A class this does not know goes by the driver's name.
+fn engine_label(class: &str) -> String {
+    match class {
+        "render" | "gfx" => fl!("engine-3d"),
+        "compute" => fl!("engine-compute"),
+        "copy" | "dma" => fl!("engine-copy"),
+        "video" => fl!("engine-video"),
+        "video-enhance" | "vpe" => fl!("engine-video-enhance"),
+        "dec" => fl!("engine-decode"),
+        "enc" => fl!("engine-encode"),
+        "enc_1" => fl!("engine-encode-2"),
+        "jpeg" => fl!("engine-jpeg"),
+        other => other.to_owned(),
+    }
+}
+
 /// A rail reading with its temperature beside it, `16% (34 °C)`, as the reference writes it
 /// for a graphics card; the reading alone where there is no sensor.
 fn with_temperature(reading: String, celsius: Option<f32>) -> String {
@@ -2230,6 +2365,18 @@ mod tests {
         }
         assert_eq!(history.celsius.len(), WINDOW);
         assert_eq!(history.temperature_top, 100.0);
+    }
+
+    /// Engines go in the reference's order whatever order the driver lists them in, and a
+    /// class this does not know goes last.
+    #[test]
+    fn engines_go_3d_first_and_unknown_last() {
+        let mut classes = vec!["video-enhance", "zzz", "copy", "render", "video"];
+        classes.sort_by_key(|class| engine_rank(class));
+        assert_eq!(classes, ["render", "copy", "video", "video-enhance", "zzz"]);
+        let mut amd = vec!["jpeg", "enc", "dec", "dma", "gfx", "compute"];
+        amd.sort_by_key(|class| engine_rank(class));
+        assert_eq!(amd, ["gfx", "compute", "dma", "dec", "enc", "jpeg"]);
     }
 
     /// A memory graph is a share of its limit, and never leaves the scale: a counter read
