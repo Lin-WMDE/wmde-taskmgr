@@ -71,7 +71,7 @@ summary-memory = { $used } of { $total }
 # Both rates on one line, the way the reference writes "S: 0 R: 0 Kbps".
 summary-disk-rate = R: { $read }  W: { $write }
 summary-net-rate = In: { $rx }  Out: { $tx }
-summary-gpu-temperature = { $busy } ({ $temp } °C)
+summary-temperature = { $reading } ({ $temp } °C)
 temperature-c = { $value } °C
 
 search = Search
@@ -125,7 +125,7 @@ fact-mem-modules = Modules
 fact-gpu-memory = Video memory
 fact-gpu-memory-busy = Memory controller
 fact-gpu-shared = Shared memory
-fact-gpu-temperature = Temperature
+fact-temperature = Temperature
 fact-gpu-chip = Chip:
 fact-gpu-driver = Driver:
 fact-gpu-node = Node:

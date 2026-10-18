@@ -345,6 +345,8 @@ pub struct Performance {
     /// The two figures of the facts panel that do not sit still.
     live: Live,
     speed_khz: Option<u64>,
+    /// Degrees Celsius of the processor package, where it has a sensor.
+    cpu_temperature: Option<f32>,
     handles: Option<u64>,
     /// Processes and threads as of the last walk, handed in by the application: this half
     /// samples the machine, not `/proc/*/`.
@@ -386,6 +388,7 @@ impl Performance {
             modules: Report::load(),
             live: Live::new(),
             speed_khz: None,
+            cpu_temperature: None,
             handles: None,
             counts: (0, 0),
         }
@@ -410,6 +413,7 @@ impl Performance {
 
         self.colors = device_colors();
         self.speed_khz = self.live.speed_khz();
+        self.cpu_temperature = self.live.temperature();
         self.handles = Live::handles();
 
         let total = s.mem_total.max(1) as f32;
@@ -829,7 +833,7 @@ impl Performance {
         let first = 1 + self.devices.len() + self.cores.len();
         let graphs = [
             (
-                fl!("fact-gpu-temperature"),
+                fl!("fact-temperature"),
                 card.temperature.map(|_| {
                     fl!(
                         "temperature-c",
@@ -1182,9 +1186,17 @@ impl Performance {
             counts.push(pair(fl!("fact-handles"), handles.to_string()));
         }
 
-        let panel = widget::column::with_capacity(16)
+        let mut panel = widget::column::with_capacity(16)
             .spacing(spacing.space_xxs)
-            .push(group(top))
+            .push(group(top));
+        // A row of its own: a third figure beside load and clock does not fit the column.
+        if let Some(celsius) = self.cpu_temperature {
+            panel = panel.push(group(vec![pair(
+                fl!("fact-temperature"),
+                fl!("temperature-c", value = format!("{celsius:.0}")),
+            )]));
+        }
+        let panel = panel
             .push(group(counts))
             .push(group(vec![pair(fl!("fact-uptime"), uptime())]));
 
@@ -1491,7 +1503,7 @@ impl Performance {
     fn reading(&self, device: Device) -> String {
         let s = &self.last;
         match device {
-            Device::Cpu => percent(s.cpu.iter().sum()),
+            Device::Cpu => with_temperature(percent(s.cpu.iter().sum()), self.cpu_temperature),
             Device::Memory => percent(s.mem[0] as f32 / s.mem_total.max(1) as f32),
             Device::Disk(i) => {
                 let meter = self.probe.disks().get(i);
@@ -1507,21 +1519,24 @@ impl Performance {
                 let lanes = meter.map_or([0.0; 2], |meter| meter.rate);
                 fl!("summary-net-rate", rx = rate(lanes[0]), tx = rate(lanes[1]))
             }
-            // `16% (34 °C)`, as the reference writes it; the bare share for a card without a
-            // sensor of its own.
             Device::Gpu(i) => {
                 let card = self.gpus.cards().get(i);
-                let busy = gpu_busy(card);
-                match card.and_then(|card| card.temperature) {
-                    Some(celsius) => fl!(
-                        "summary-gpu-temperature",
-                        busy = busy,
-                        temp = format!("{celsius:.0}")
-                    ),
-                    None => busy,
-                }
+                with_temperature(gpu_busy(card), card.and_then(|card| card.temperature))
             }
         }
+    }
+}
+
+/// A rail reading with its temperature beside it, `16% (34 °C)`, as the reference writes it
+/// for a graphics card; the reading alone where there is no sensor.
+fn with_temperature(reading: String, celsius: Option<f32>) -> String {
+    match celsius {
+        Some(celsius) => fl!(
+            "summary-temperature",
+            reading = reading,
+            temp = format!("{celsius:.0}")
+        ),
+        None => reading,
     }
 }
 
@@ -1602,7 +1617,7 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
     let figure = |fact: GpuFact| match fact {
         GpuFact::Utilization => pair(fl!("fact-utilization"), gpu_busy(Some(card))),
         GpuFact::Temperature => pair(
-            fl!("fact-gpu-temperature"),
+            fl!("fact-temperature"),
             card.temperature.map_or_else(
                 || fl!("no-value"),
                 |celsius| fl!("temperature-c", value = format!("{celsius:.0}")),

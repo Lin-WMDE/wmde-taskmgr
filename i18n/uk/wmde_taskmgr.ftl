@@ -69,7 +69,7 @@ show-overall = Загалом
 summary-memory = { $used } з { $total }
 summary-disk-rate = Ч: { $read }  З: { $write }
 summary-net-rate = Пр: { $rx }  Пер: { $tx }
-summary-gpu-temperature = { $busy } ({ $temp } °C)
+summary-temperature = { $reading } ({ $temp } °C)
 temperature-c = { $value } °C
 
 search = Пошук
@@ -119,7 +119,7 @@ fact-mem-modules = Модулі
 fact-gpu-memory = Відеопамʼять
 fact-gpu-memory-busy = Контролер памʼяті
 fact-gpu-shared = Спільна памʼять
-fact-gpu-temperature = Температура
+fact-temperature = Температура
 fact-gpu-chip = Чіп:
 fact-gpu-driver = Драйвер:
 fact-gpu-node = Вузол:

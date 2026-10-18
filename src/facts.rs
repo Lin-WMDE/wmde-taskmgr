@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const CPU_DIR: &str = "/sys/devices/system/cpu";
+const HWMON_DIR: &str = "/sys/class/hwmon";
 
 /// What the machine is. Empty strings and `None` for anything the machine does not say.
 #[derive(Clone, Debug, Default)]
@@ -178,7 +179,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// The two figures of the panel that change while the window is open.
+/// The figures of the panel that change while the window is open.
 ///
 /// Kept apart from [`Facts`] because they are read every tick and everything in `Facts` is
 /// read once. The paths are collected at start-up so a tick is file reads and nothing else.
@@ -186,6 +187,9 @@ pub struct Live {
     /// One per logical processor. Empty when the machine has no cpufreq, which is the usual
     /// state under a hypervisor - and then the speed row is simply not drawn.
     freq: Vec<PathBuf>,
+    /// The package temperature input, one per socket. Empty on a machine whose processor
+    /// driver registers no sensor - every virtual machine.
+    temperature: Vec<PathBuf>,
 }
 
 impl Default for Live {
@@ -213,7 +217,21 @@ impl Live {
             }
         }
         freq.sort();
-        Self { freq }
+        Self {
+            freq,
+            temperature: cpu_sensors(Path::new(HWMON_DIR)),
+        }
+    }
+
+    /// The processor's temperature in degrees Celsius: the hottest package, where there are
+    /// several sockets.
+    #[must_use]
+    pub fn temperature(&self) -> Option<f32> {
+        self.temperature
+            .iter()
+            .filter_map(|path| read_trimmed(path)?.parse::<i64>().ok())
+            .max()
+            .map(|millidegrees| millidegrees as f32 / 1000.0)
     }
 
     /// Current clock in kHz, averaged over the processors that answer.
@@ -248,9 +266,155 @@ impl Live {
     }
 }
 
+/// The inputs that read the whole processor, under a `/sys/class/hwmon` or a test's stand-in.
+///
+/// `coretemp` (Intel) labels one input per socket `Package id N`, beside one per core.
+/// `k10temp` (AMD) labels the die `Tdie` on the parts that report it apart and `Tctl`
+/// everywhere; `Tctl` carries an offset on some parts, so `Tdie` is taken where it is there.
+/// `zenpower` uses the same labels. Anything else - a board sensor, `acpitz` - is not the
+/// processor and is not taken.
+fn cpu_sensors(root: &Path) -> Vec<PathBuf> {
+    let mut packages = Vec::new();
+    let mut amd: Option<(u8, PathBuf)> = None;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return packages;
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let Some(name) = read_trimmed(&dir.join("name")) else {
+            continue;
+        };
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut labels: Vec<(String, PathBuf)> = files
+            .flatten()
+            .filter_map(|file| {
+                let file = file.file_name();
+                let stem = file.to_str()?.strip_suffix("_label")?;
+                stem.starts_with("temp").then(|| stem.to_owned())
+            })
+            .filter_map(|stem| {
+                let label = read_trimmed(&dir.join(format!("{stem}_label")))?;
+                Some((label, dir.join(format!("{stem}_input"))))
+            })
+            .collect();
+        labels.sort();
+        match name.as_str() {
+            "coretemp" => packages.extend(
+                labels
+                    .into_iter()
+                    .filter(|(label, _)| label.starts_with("Package id"))
+                    .map(|(_, input)| input),
+            ),
+            "k10temp" | "zenpower" => {
+                for (label, input) in labels {
+                    let rank = match label.as_str() {
+                        "Tdie" => 0,
+                        "Tctl" => 1,
+                        _ => continue,
+                    };
+                    if amd.as_ref().is_none_or(|(best, _)| rank < *best) {
+                        amd = Some((rank, input));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    packages.extend(amd.map(|(_, input)| input));
+    packages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in `hwmon` tree: each sensor a directory with its name and labelled inputs.
+    fn hwmon(tag: &str, sensors: &[(&str, &[(&str, &str)])]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wmde-taskmgr-hwmon-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (n, (name, inputs)) in sensors.iter().enumerate() {
+            let dir = root.join(format!("hwmon{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("name"), format!("{name}\n")).unwrap();
+            for (i, (label, value)) in inputs.iter().enumerate() {
+                std::fs::write(
+                    dir.join(format!("temp{}_label", i + 1)),
+                    format!("{label}\n"),
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.join(format!("temp{}_input", i + 1)),
+                    format!("{value}\n"),
+                )
+                .unwrap();
+            }
+        }
+        root
+    }
+
+    /// Read off `.131`: `coretemp` with the package first and a line per core.
+    #[test]
+    fn intel_reads_the_package_not_a_core() {
+        let root = hwmon(
+            "intel",
+            &[
+                ("acpitz", &[]),
+                ("nvme", &[("Composite", "40850")]),
+                (
+                    "coretemp",
+                    &[
+                        ("Package id 0", "52000"),
+                        ("Core 0", "49000"),
+                        ("Core 1", "55000"),
+                    ],
+                ),
+            ],
+        );
+        let sensors = cpu_sensors(&root);
+        assert_eq!(sensors.len(), 1);
+        let live = Live {
+            freq: Vec::new(),
+            temperature: sensors,
+        };
+        assert_eq!(live.temperature(), Some(52.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn amd_prefers_the_die_to_the_control_reading() {
+        let root = hwmon(
+            "amd",
+            &[(
+                "k10temp",
+                &[("Tctl", "61000"), ("Tdie", "51000"), ("Tccd1", "48000")],
+            )],
+        );
+        let live = Live {
+            freq: Vec::new(),
+            temperature: cpu_sensors(&root),
+        };
+        assert_eq!(live.temperature(), Some(51.0));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = hwmon("amd-tctl", &[("k10temp", &[("Tctl", "61000")])]);
+        assert_eq!(cpu_sensors(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A virtual machine: board sensors only, and no reading rather than a wrong one.
+    #[test]
+    fn no_processor_sensor_means_no_temperature() {
+        let root = hwmon(
+            "none",
+            &[("acpitz", &[]), ("nvme", &[("Composite", "40850")])],
+        );
+        assert!(cpu_sensors(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_running_machine_describes_itself() {
