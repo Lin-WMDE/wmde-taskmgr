@@ -1191,7 +1191,20 @@ impl Performance {
                 let lanes = meter.map_or([0.0; 2], |meter| meter.rate);
                 fl!("summary-net-rate", rx = rate(lanes[0]), tx = rate(lanes[1]))
             }
-            Device::Gpu(i) => gpu_busy(self.gpus.cards().get(i)),
+            // `16% (34 °C)`, as the reference writes it; the bare share for a card without a
+            // sensor of its own.
+            Device::Gpu(i) => {
+                let card = self.gpus.cards().get(i);
+                let busy = gpu_busy(card);
+                match card.and_then(|card| card.temperature) {
+                    Some(celsius) => fl!(
+                        "summary-gpu-temperature",
+                        busy = busy,
+                        temp = format!("{celsius:.0}")
+                    ),
+                    None => busy,
+                }
+            }
         }
     }
 }
@@ -1202,14 +1215,48 @@ fn gpu_busy(card: Option<&Card>) -> String {
         .map_or_else(|| fl!("no-value"), percent)
 }
 
+/// One figure of a graphics card's facts column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuFact {
+    Utilization,
+    Temperature,
+    MemoryController,
+    VideoMemory,
+    SharedMemory,
+}
+
+/// The figures a card's facts column draws, in this order: utilization always, every other
+/// one only where its source answered.
+fn gpu_facts(card: &Card) -> Vec<GpuFact> {
+    let mut facts = vec![GpuFact::Utilization];
+    if card.temperature.is_some() {
+        facts.push(GpuFact::Temperature);
+    }
+    if card.memory_busy.is_some() {
+        facts.push(GpuFact::MemoryController);
+    }
+    if card.memory.is_some() {
+        facts.push(GpuFact::VideoMemory);
+    }
+    if card.shared.is_some() {
+        facts.push(GpuFact::SharedMemory);
+    }
+    facts
+}
+
+/// Figures per row of the facts column. Three do not fit in `FACTS_WIDTH`: `Контролер памʼяті`
+/// alone takes about a hundred pixels.
+const GPU_FACTS_PER_ROW: usize = 2;
+
 /// The facts panel of a graphics card: what it is doing, what memory it holds, then what it
 /// is.
 ///
 /// Utilization is always drawn - a dash for a card that publishes none, so the page says
 /// "unknown" in the place the figure would be. Every other figure is drawn only when its
-/// source answered: the memory controller and video memory for NVIDIA and AMD, shared memory
-/// for AMD (against its limit) and Intel (alone, as it has none). The chip is drawn only when
-/// `pci.ids` names one.
+/// source answered: temperature where the card has a sensor of its own, the memory controller
+/// and video memory for NVIDIA and AMD, shared memory for AMD (against its limit) and Intel
+/// (alone, as it has none). They go two to a row, in `gpu_facts` order. The chip is drawn only
+/// when `pci.ids` names one.
 fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let pair = |label: String, value: String| {
@@ -1228,10 +1275,6 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
             .push(widget::text::caption(value).wrapping(Wrapping::None))
     };
 
-    let mut top = vec![pair(fl!("fact-utilization"), gpu_busy(Some(card)))];
-    if let Some(busy) = card.memory_busy {
-        top.push(pair(fl!("fact-gpu-memory-busy"), percent(busy)));
-    }
     let of = |used: u64, total: u64| {
         fl!(
             "fact-mem-committed-value",
@@ -1239,17 +1282,36 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
             limit = size(total)
         )
     };
-    let mut memory = Vec::with_capacity(2);
-    if let Some((used, total)) = card.memory {
-        memory.push(pair(fl!("fact-gpu-memory"), of(used, total)));
-    }
-    if let Some((used, limit)) = card.shared {
-        let value = match limit {
-            Some(limit) => of(used, limit),
-            None => size(used),
-        };
-        memory.push(pair(fl!("fact-gpu-shared"), value));
-    }
+    // Every arm but the first only runs for a fact `gpu_facts` found a reading for.
+    let figure = |fact: GpuFact| match fact {
+        GpuFact::Utilization => pair(fl!("fact-utilization"), gpu_busy(Some(card))),
+        GpuFact::Temperature => pair(
+            fl!("fact-gpu-temperature"),
+            card.temperature.map_or_else(
+                || fl!("no-value"),
+                |celsius| fl!("temperature-c", value = format!("{celsius:.0}")),
+            ),
+        ),
+        GpuFact::MemoryController => pair(
+            fl!("fact-gpu-memory-busy"),
+            card.memory_busy.map_or_else(|| fl!("no-value"), percent),
+        ),
+        GpuFact::VideoMemory => pair(
+            fl!("fact-gpu-memory"),
+            card.memory
+                .map_or_else(|| fl!("no-value"), |(used, total)| of(used, total)),
+        ),
+        GpuFact::SharedMemory => pair(
+            fl!("fact-gpu-shared"),
+            card.shared.map_or_else(
+                || fl!("no-value"),
+                |(used, limit)| match limit {
+                    Some(limit) => of(used, limit),
+                    None => size(used),
+                },
+            ),
+        ),
+    };
 
     let mut list = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
     if let Some(chip) = name
@@ -1265,11 +1327,10 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
         .push(line(fl!("fact-gpu-node"), card.node.to_string()))
         .push(line(fl!("fact-gpu-location"), card.address.to_string()));
 
-    let mut panel = widget::column::with_capacity(3)
-        .spacing(spacing.space_xxs)
-        .push(group(top));
-    if !memory.is_empty() {
-        panel = panel.push(group(memory));
+    let facts = gpu_facts(card);
+    let mut panel = widget::column::with_capacity(4).spacing(spacing.space_xxs);
+    for row in facts.chunks(GPU_FACTS_PER_ROW) {
+        panel = panel.push(group(row.iter().map(|fact| figure(*fact)).collect()));
     }
     panel.push(list).into()
 }
@@ -1491,6 +1552,51 @@ mod tests {
         assert_eq!(valid(Device::Gpu(1), 0, 0, 1), Device::Cpu);
         // The two that are always there are never touched, whatever is plugged in.
         assert_eq!(valid(Device::Memory, 0, 0, 0), Device::Memory);
+    }
+
+    /// The facts column fills rows of two, in a fixed order, with only what the card reports.
+    #[test]
+    fn a_card_reports_its_facts_two_to_a_row() {
+        use GpuFact::*;
+        let rows = |card: &Card| -> Vec<Vec<GpuFact>> {
+            gpu_facts(card)
+                .chunks(GPU_FACTS_PER_ROW)
+                .map(<[GpuFact]>::to_vec)
+                .collect()
+        };
+
+        let mut nvidia = Card::bare();
+        nvidia.busy = Some(0.16);
+        nvidia.temperature = Some(34.0);
+        nvidia.memory_busy = Some(0.18);
+        nvidia.memory = Some((448 << 20, 6 << 30));
+        assert_eq!(
+            rows(&nvidia),
+            [
+                vec![Utilization, Temperature],
+                vec![MemoryController, VideoMemory]
+            ]
+        );
+
+        let mut amd = Card::bare();
+        amd.temperature = Some(45.0);
+        amd.memory_busy = Some(0.1);
+        amd.memory = Some((1 << 30, 8 << 30));
+        amd.shared = Some((256 << 20, Some(8 << 30)));
+        assert_eq!(
+            rows(&amd),
+            [
+                vec![Utilization, Temperature],
+                vec![MemoryController, VideoMemory],
+                vec![SharedMemory]
+            ]
+        );
+
+        let mut intel = Card::bare();
+        intel.shared = Some((68 << 20, None));
+        assert_eq!(rows(&intel), [vec![Utilization, SharedMemory]]);
+
+        assert_eq!(rows(&Card::bare()), [vec![Utilization]]);
     }
 
     /// A memory graph is a share of its limit, and never leaves the scale: a counter read

@@ -13,8 +13,10 @@
 //! | `i915` | idle residency, `gt/gt0/rc6_residency_ms` | none | DRM clients' `fdinfo` |
 //! | `xe` | idle residency, `device/tile0/gt0/gtidle/idle_residency_ms` | none | as `i915` |
 //!
-//! NVML and `amdgpu` also say how busy the memory controller is. Any other card - a virtual
-//! one, nouveau - is listed with its name and no reading. Nothing here needs root or starts a
+//! NVML and `amdgpu` also say how busy the memory controller is. Temperature comes from NVML
+//! for `nvidia` and from the card's own `hwmon` sensor for the drivers that register one
+//! (`amdgpu`, `nouveau`); an integrated Intel card has none. Any other card - a virtual
+//! one - is listed with its name and no reading. Nothing here needs root or starts a
 //! process: `nvidia-smi` would cost a process every tick.
 
 use std::ffi::{CString, OsStr, c_char, c_int, c_uint, c_void};
@@ -50,7 +52,11 @@ pub struct Card {
     /// `amdgpu` reports both (GTT); for an Intel card it is the sum over the DRM clients this
     /// user can see, and has no limit but the machine's memory.
     pub shared: Option<(u64, Option<u64>)>,
+    /// Degrees Celsius. `None` for a card without a sensor of its own.
+    pub temperature: Option<f32>,
     source: Source,
+    /// The card's `hwmon` temperature input, found once at start-up.
+    thermal: Option<PathBuf>,
 }
 
 enum Source {
@@ -121,6 +127,7 @@ impl Gpus {
             // not the `virtio-pci` transport bound to the function above it.
             let driver = link_basename(&link.join("driver")).unwrap_or_default();
             let source = source_for(&driver, &card_dir, &device);
+            let thermal = hwmon_temperature(&device);
             cards.push(Card {
                 node: name.into(),
                 driver: driver.into(),
@@ -130,7 +137,9 @@ impl Gpus {
                 memory: None,
                 memory_busy: None,
                 shared: None,
+                temperature: None,
                 source,
+                thermal,
             });
         }
         cards.sort_by_key(|card| card_number(&card.node));
@@ -202,6 +211,14 @@ impl Gpus {
                     *last = idle.map(|idle| (idle, now));
                 }
             }
+            card.temperature = match (&card.source, nvml.as_ref()) {
+                (Source::Nvml(handle), Some(nvml)) => nvml.temperature(*handle),
+                _ => card
+                    .thermal
+                    .as_deref()
+                    .and_then(|path| read_u64(path, buf))
+                    .map(|millidegrees| millidegrees as f32 / 1000.0),
+            };
         }
 
         // An Intel card's share of the machine's memory has no counter of its own; it is
@@ -214,6 +231,26 @@ impl Gpus {
                     .find(|(pdev, _)| **pdev == *card.address)
                     .map(|(_, bytes)| (*bytes, None));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Card {
+    /// A card with no source and no reading, for tests outside this module to fill in.
+    pub fn bare() -> Self {
+        Self {
+            node: "card0".into(),
+            driver: "".into(),
+            address: "0000:00:02.0".into(),
+            device: PathBuf::new(),
+            busy: None,
+            memory: None,
+            memory_busy: None,
+            shared: None,
+            temperature: None,
+            source: Source::None,
+            thermal: None,
         }
     }
 }
@@ -268,6 +305,40 @@ fn idle_source(path: PathBuf) -> Source {
     } else {
         Source::None
     }
+}
+
+/// The card's own temperature sensor, if its driver registers one under the PCI function:
+/// the input labelled `edge` where the inputs are labelled (`amdgpu`: edge, junction,
+/// memory - and edge is what the reference shows), otherwise the lowest-numbered one
+/// (`nouveau` has a single, unlabelled input).
+fn hwmon_temperature(device: &Path) -> Option<PathBuf> {
+    let mut inputs: Vec<(u32, PathBuf)> = Vec::new();
+    for hwmon in std::fs::read_dir(device.join("hwmon"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let dir = hwmon.path();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(number) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("temp"))
+                .and_then(|rest| rest.strip_suffix("_input"))
+                .and_then(|number| number.parse().ok())
+            else {
+                continue;
+            };
+            if read_text(&dir.join(format!("temp{number}_label"))).as_deref() == Some("edge") {
+                return Some(entry.path());
+            }
+            inputs.push((number, entry.path()));
+        }
+    }
+    inputs
+        .into_iter()
+        .min_by_key(|(number, _)| *number)
+        .map(|(_, path)| path)
 }
 
 /// Busy share of an interval from a cumulative idle counter: everything the card did not
@@ -455,6 +526,25 @@ struct NvmlMemory {
     used: u64,
 }
 
+/// `nvmlMemory_v2_t`: `used` here leaves out what the driver reserves for itself, which the
+/// first version counts as used - a GTX 1660 reads 391 MiB fuller than `nvidia-smi` says.
+#[repr(C)]
+#[derive(Default)]
+struct NvmlMemoryV2 {
+    version: c_uint,
+    total: u64,
+    reserved: u64,
+    free: u64,
+    used: u64,
+}
+
+/// `nvmlMemory_v2`, NVML's `NVML_STRUCT_VERSION(Memory, 2)`: the struct's size with the
+/// version in the top byte. A call with any other value is refused.
+const NVML_MEMORY_V2: c_uint = std::mem::size_of::<NvmlMemoryV2>() as c_uint | 2 << 24;
+
+/// `NVML_TEMPERATURE_GPU`: the die.
+const NVML_TEMPERATURE_GPU: c_uint = 0;
+
 /// NVIDIA's management library, opened at run time: the package does not depend on the
 /// driver, and a machine without an NVIDIA card never loads it.
 struct Nvml {
@@ -462,6 +552,9 @@ struct Nvml {
     handle_by_bus_id: unsafe extern "C" fn(*const c_char, *mut NvmlDevice) -> c_int,
     utilization: unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> c_int,
     memory_info: unsafe extern "C" fn(NvmlDevice, *mut NvmlMemory) -> c_int,
+    /// Drivers from 510 on; an older one has only the first version.
+    memory_info_v2: Option<unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryV2) -> c_int>,
+    temperature: Option<unsafe extern "C" fn(NvmlDevice, c_uint, *mut c_uint) -> c_int>,
     /// Last, so it is dropped after the functions taken from it.
     _lib: libloading::Library,
 }
@@ -484,6 +577,14 @@ impl Nvml {
             let handle_by_bus_id = *lib.get(b"nvmlDeviceGetHandleByPciBusId_v2\0").ok()?;
             let utilization = *lib.get(b"nvmlDeviceGetUtilizationRates\0").ok()?;
             let memory_info = *lib.get(b"nvmlDeviceGetMemoryInfo\0").ok()?;
+            let memory_info_v2 = lib
+                .get(b"nvmlDeviceGetMemoryInfo_v2\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let temperature = lib
+                .get(b"nvmlDeviceGetTemperature\0")
+                .ok()
+                .map(|symbol| *symbol);
             let rc = init();
             if rc != NVML_SUCCESS {
                 tracing::warn!(
@@ -497,6 +598,8 @@ impl Nvml {
                 handle_by_bus_id,
                 utilization,
                 memory_info,
+                memory_info_v2,
+                temperature,
                 _lib: lib,
             })
         }
@@ -519,11 +622,32 @@ impl Nvml {
         (rc == NVML_SUCCESS).then(|| (share(rates.gpu), share(rates.memory)))
     }
 
+    /// Video memory in use, without the driver's reserve where the driver can say, and in all.
     fn memory(&self, device: usize) -> Option<(u64, u64)> {
+        if let Some(memory_info_v2) = self.memory_info_v2 {
+            let mut memory = NvmlMemoryV2 {
+                version: NVML_MEMORY_V2,
+                ..NvmlMemoryV2::default()
+            };
+            // SAFETY: as for `utilization`, with the version field the call checks.
+            let rc = unsafe { memory_info_v2(device as NvmlDevice, &mut memory) };
+            if rc == NVML_SUCCESS && memory.total > 0 {
+                return Some((memory.used, memory.total));
+            }
+        }
         let mut memory = NvmlMemory::default();
         // SAFETY: as for `utilization`.
         let rc = unsafe { (self.memory_info)(device as NvmlDevice, &mut memory) };
         (rc == NVML_SUCCESS && memory.total > 0).then_some((memory.used, memory.total))
+    }
+
+    /// The die temperature in degrees Celsius.
+    fn temperature(&self, device: usize) -> Option<f32> {
+        let call = self.temperature?;
+        let mut celsius: c_uint = 0;
+        // SAFETY: a handle NVML gave out, a sensor it defines, and a place for the reading.
+        let rc = unsafe { call(device as NvmlDevice, NVML_TEMPERATURE_GPU, &mut celsius) };
+        (rc == NVML_SUCCESS).then_some(celsius as f32)
     }
 }
 
@@ -835,6 +959,57 @@ mod tests {
         gpus.proc = sys.proc();
         gpus.sample(Instant::now());
         assert_eq!(gpus.cards()[0].shared, None);
+    }
+
+    /// NVML checks the version field against its own idea of the struct: size in the low
+    /// bytes, version in the top one.
+    #[test]
+    fn the_v2_memory_struct_is_the_one_nvml_expects() {
+        assert_eq!(std::mem::size_of::<NvmlMemoryV2>(), 40);
+        assert_eq!(NVML_MEMORY_V2, 0x0200_0028);
+    }
+
+    #[test]
+    fn amdgpu_temperature_is_the_edge_sensor() {
+        let sys = Sysfs::new("hwmon-amd");
+        let device = sys.card("card0", "0000:03:00.0", "0x030000", "amdgpu");
+        let hwmon = device.join("hwmon/hwmon3");
+        fs::create_dir_all(&hwmon).unwrap();
+        for (n, label, milli) in [
+            (1, "edge", "45000"),
+            (2, "junction", "52000"),
+            (3, "mem", "60000"),
+        ] {
+            fs::write(hwmon.join(format!("temp{n}_input")), format!("{milli}\n")).unwrap();
+            fs::write(hwmon.join(format!("temp{n}_label")), format!("{label}\n")).unwrap();
+        }
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.sample(Instant::now());
+        assert_eq!(gpus.cards()[0].temperature, Some(45.0));
+    }
+
+    #[test]
+    fn an_unlabelled_sensor_is_taken_by_its_number() {
+        let sys = Sysfs::new("hwmon-nouveau");
+        let device = sys.card("card0", "0000:01:00.0", "0x030000", "nouveau");
+        let hwmon = device.join("hwmon/hwmon2");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(hwmon.join("temp1_input"), "38500\n").unwrap();
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.sample(Instant::now());
+        let card = &gpus.cards()[0];
+        assert_eq!(card.temperature, Some(38.5));
+        // A temperature, and still no utilization: the two are separate sources.
+        assert_eq!(card.busy, None);
+    }
+
+    #[test]
+    fn a_card_without_hwmon_has_no_temperature() {
+        let sys = Sysfs::new("hwmon-none");
+        sys.card("card0", "0000:00:02.0", "0x030000", "vmwgfx");
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.sample(Instant::now());
+        assert_eq!(gpus.cards()[0].temperature, None);
     }
 
     #[test]
