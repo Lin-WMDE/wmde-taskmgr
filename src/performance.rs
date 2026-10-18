@@ -1652,8 +1652,7 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
 }
 
 /// The style a device's graph is drawn in: a network card's two directions as lines of their
-/// own, receive solid and send dashed as the reference draws them; everything else as one
-/// curve.
+/// own, receive solid and send dashed; everything else as one curve.
 fn graph_style(kind: Kind, cols: u16, rows: u16) -> Style {
     if matches!(kind, Kind::Network) {
         Style::Lines { cols, rows }
