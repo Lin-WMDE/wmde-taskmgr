@@ -402,8 +402,10 @@ impl Gpus {
             card.engines = engines;
         }
 
+        // Added to what NVML said of the same process: a laptop's game holds memory on both
+        // its NVIDIA card and its Intel one.
         for (pid, held) in &usage.held {
-            processes.entry(*pid).or_default().memory = Some(*held);
+            *processes.entry(*pid).or_default().memory.get_or_insert(0) += *held;
         }
         if let Some(ns) = elapsed {
             for ((pid, pdev, class), busy) in &usage.pid_busy {

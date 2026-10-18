@@ -991,11 +991,18 @@ impl Performance {
                         continue;
                     };
                     let (class, rings) = &history.engines[n];
-                    let now = card
-                        .engines
-                        .iter()
-                        .find(|engine| engine.class == *class)
-                        .map_or_else(|| fl!("no-value"), |engine| percent(engine.busy));
+                    // A class with no client this tick was idle and is drawn at zero; the figure
+                    // says the same. Only before the first interval is there nothing to say.
+                    let now = if card.engines.is_empty() {
+                        fl!("no-value")
+                    } else {
+                        percent(
+                            card.engines
+                                .iter()
+                                .find(|engine| engine.class == *class)
+                                .map_or(0.0, |engine| engine.busy),
+                        )
+                    };
                     let tile = widget::column::with_capacity(2)
                         .push(
                             widget::row::with_capacity(3)

@@ -275,7 +275,6 @@ impl Live {
 /// processor and is not taken.
 fn cpu_sensors(root: &Path) -> Vec<PathBuf> {
     let mut packages = Vec::new();
-    let mut amd: Option<(u8, PathBuf)> = None;
     let Ok(entries) = std::fs::read_dir(root) else {
         return packages;
     };
@@ -308,22 +307,24 @@ fn cpu_sensors(root: &Path) -> Vec<PathBuf> {
                     .filter(|(label, _)| label.starts_with("Package id"))
                     .map(|(_, input)| input),
             ),
+            // One sensor per socket, as for coretemp: the best label of each.
             "k10temp" | "zenpower" => {
+                let mut best: Option<(u8, PathBuf)> = None;
                 for (label, input) in labels {
                     let rank = match label.as_str() {
                         "Tdie" => 0,
                         "Tctl" => 1,
                         _ => continue,
                     };
-                    if amd.as_ref().is_none_or(|(best, _)| rank < *best) {
-                        amd = Some((rank, input));
+                    if best.as_ref().is_none_or(|(seen, _)| rank < *seen) {
+                        best = Some((rank, input));
                     }
                 }
+                packages.extend(best.map(|(_, input)| input));
             }
             _ => {}
         }
     }
-    packages.extend(amd.map(|(_, input)| input));
     packages
 }
 
@@ -402,6 +403,25 @@ mod tests {
 
         let root = hwmon("amd-tctl", &[("k10temp", &[("Tctl", "61000")])]);
         assert_eq!(cpu_sensors(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two AMD sockets: a sensor each, and the hotter one is the reading.
+    #[test]
+    fn two_amd_sockets_read_the_hotter() {
+        let root = hwmon(
+            "amd-two",
+            &[
+                ("k10temp", &[("Tctl", "61000"), ("Tdie", "51000")]),
+                ("k10temp", &[("Tctl", "70000"), ("Tdie", "58000")]),
+            ],
+        );
+        let live = Live {
+            freq: Vec::new(),
+            temperature: cpu_sensors(&root),
+        };
+        assert_eq!(live.temperature.len(), 2);
+        assert_eq!(live.temperature(), Some(58.0));
         let _ = std::fs::remove_dir_all(&root);
     }
 

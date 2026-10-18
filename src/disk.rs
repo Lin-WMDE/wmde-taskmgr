@@ -175,9 +175,12 @@ impl DiskFacts {
             }
             facts.system |= point == "/";
             // Subvolumes of one btrfs share its device and its size: one count.
-            if counted.insert(device)
+            // Counted once it answers: a mount that refuses `statvfs` leaves the next mount
+            // of the same filesystem to try.
+            if !counted.contains(&device)
                 && let Some(bytes) = size_of(point)
             {
+                counted.insert(device);
                 *facts.formatted.get_or_insert(0) += bytes;
             }
         }
@@ -472,6 +475,21 @@ mod tests {
         let facts = DiskFacts::read_at(&root, "nvme0n1", mountinfo, swaps, &device_of, &|_| None);
         assert!(facts.swap);
         assert_eq!(facts.formatted, None, "no size answered");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The first mount of a filesystem refuses `statvfs`; the second answers, and the
+    /// filesystem is counted once, from it.
+    #[test]
+    fn a_filesystem_is_sized_by_the_first_mount_that_answers() {
+        let root = block("statvfs");
+        let mountinfo = "\
+            25 1 0:24 /@ / rw shared:1 - btrfs /dev/mapper/vg-root rw\n\
+            26 25 0:24 /@home /home rw shared:2 - btrfs /dev/mapper/vg-root rw\n";
+        let device_of = |path: &str| (path == "/dev/mapper/vg-root").then_some((254, 1));
+        let size_of = |point: &str| (point == "/home").then_some(400_u64 << 30);
+        let facts = DiskFacts::read_at(&root, "nvme0n1", mountinfo, "", &device_of, &size_of);
+        assert_eq!(facts.formatted, Some(400 << 30));
         let _ = fs::remove_dir_all(&root);
     }
 

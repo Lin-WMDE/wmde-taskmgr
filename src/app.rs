@@ -255,11 +255,6 @@ impl App {
         self.table = model;
     }
 
-    /// The selected row.
-    ///
-    /// Read out of the item map. `active_data` reads the model's `storage` map, which only
-    /// `EntityMut::data()` ever fills, and the rows here are inserted without it - so that
-    /// call returned `None` for every row and left the header button dead.
     /// Hand the machine-wide figures to the column headings.
     fn publish_totals(&self) {
         let s = self.performance.last();
