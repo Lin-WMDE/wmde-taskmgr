@@ -57,6 +57,8 @@ const THUMB_WIDTH: f32 = 80.0;
 const THUMB_HEIGHT: f32 = 54.0;
 const RAIL_WIDTH: f32 = 278.0;
 const FACTS_WIDTH: f32 = 250.0;
+/// The same on a network card's page, where the values - a MAC, a packet count - are wider.
+const NET_KEY_WIDTH: f32 = 112.0;
 /// Width of the key column in the facts list, so every value starts on one line.
 const FACT_KEY_WIDTH: f32 = 148.0;
 /// Gap between rows of the rail. Below any theme step on purpose: at 74 px a row is tall
@@ -602,7 +604,7 @@ impl Performance {
         // The heading has the width the rail has not, so it carries the name whole.
         let mut heading = widget::row::with_capacity(3)
             .align_y(Alignment::Center)
-            .push(widget::text::title3(self.title(self.device)))
+            .push(widget::text::title3(self.heading_title(self.device)))
             .push(widget::Space::new().width(Length::Fill));
         let aside = self.aside(self.device);
         if !aside.is_empty() {
@@ -960,14 +962,17 @@ impl Performance {
                 .push(widget::text::heading(value).wrapping(Wrapping::None))
                 .apply(Element::from)
         };
+        // A narrower key than the other pages: a MAC, a packet count or a link speed is wider
+        // than what is left beside `FACT_KEY_WIDTH`, and is wrapped rather than cut if it still
+        // does not fit.
         let line = |label: String, value: String| {
             widget::row::with_capacity(2)
                 .push(
                     widget::text::caption(label)
                         .wrapping(Wrapping::None)
-                        .width(Length::Fixed(FACT_KEY_WIDTH)),
+                        .width(Length::Fixed(NET_KEY_WIDTH)),
                 )
-                .push(widget::text::caption(value).wrapping(Wrapping::None))
+                .push(widget::text::caption(value).wrapping(Wrapping::WordOrGlyph))
         };
         let both = |(rx, tx): (u64, u64)| fl!("net-pair", rx = rx.to_string(), tx = tx.to_string());
 
@@ -1016,30 +1021,23 @@ impl Performance {
             }
         }
         let speed = match wifi {
-            Some(wifi) => wifi.bitrate_mbps.map(link_speed),
-            None => facts.and_then(|facts| {
-                let speed = link_speed(facts.speed_mbps?);
-                Some(match facts.duplex {
-                    Some(Duplex::Full) => {
-                        fl!(
-                            "net-speed-duplex",
-                            speed = speed,
-                            duplex = fl!("net-duplex-full")
-                        )
-                    }
-                    Some(Duplex::Half) => {
-                        fl!(
-                            "net-speed-duplex",
-                            speed = speed,
-                            duplex = fl!("net-duplex-half")
-                        )
-                    }
-                    None => speed,
-                })
-            }),
+            Some(wifi) => wifi.bitrate_mbps,
+            None => facts.and_then(|facts| facts.speed_mbps),
         };
         if let Some(speed) = speed.filter(|_| !down) {
-            list = list.push(line(fl!("fact-net-speed"), speed));
+            list = list.push(line(fl!("fact-net-speed"), link_speed(speed)));
+        }
+        let duplex = facts
+            .and_then(|facts| facts.duplex)
+            .filter(|_| wifi.is_none() && !down);
+        if let Some(duplex) = duplex {
+            list = list.push(line(
+                fl!("fact-net-duplex"),
+                match duplex {
+                    Duplex::Full => fl!("net-duplex-full"),
+                    Duplex::Half => fl!("net-duplex-half"),
+                },
+            ));
         }
         if let Some(facts) = facts {
             if let Some(mac) = &facts.mac {
@@ -1372,6 +1370,20 @@ impl Performance {
                 }
             }
             Device::Gpu(_) => fl!("device-gpu"),
+        }
+    }
+
+    /// The heading of the page: the rail's name, except for a network card, which is headed
+    /// by what it is - `Ethernet`, `Wi-Fi` - as the reference heads it, with its full name
+    /// beside. Its short model is long enough to leave the full name no room beside it once
+    /// the facts column takes its share of the width.
+    fn heading_title(&self, device: Device) -> String {
+        match device {
+            Device::Network(_) => match self.catalog.interface(self.node(device)) {
+                Some(card) if card.kind == LinkKind::Wireless => fl!("device-net-wireless"),
+                _ => fl!("device-net-ethernet"),
+            },
+            _ => self.title(device),
         }
     }
 
