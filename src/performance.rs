@@ -23,7 +23,7 @@ use crate::memory::Report;
 use crate::devices::{Catalog, DiskKind, GpuName, LinkKind};
 use crate::facts::{Facts, Live};
 use crate::fl;
-use crate::gpu::{Card, Gpus};
+use crate::gpu::{Card, Fan, Gpus};
 use crate::net::{Duplex, NetFacts};
 use crate::wifi::{Band as WifiBand, WifiInfo};
 
@@ -57,8 +57,9 @@ const THUMB_WIDTH: f32 = 80.0;
 const THUMB_HEIGHT: f32 = 54.0;
 const RAIL_WIDTH: f32 = 278.0;
 const FACTS_WIDTH: f32 = 250.0;
-/// The same on a network card's page, where the values - a MAC, a packet count - are wider.
-const NET_KEY_WIDTH: f32 = 112.0;
+/// The same on a network card's and a graphics card's page, where the values - a MAC, a
+/// packet count, a power draw against its limit - are wider.
+const DEVICE_KEY_WIDTH: f32 = 112.0;
 /// Width of the key column in the facts list, so every value starts on one line.
 const FACT_KEY_WIDTH: f32 = 148.0;
 /// Gap between rows of the rail. Below any theme step on purpose: at 74 px a row is tall
@@ -974,7 +975,7 @@ impl Performance {
                 .push(
                     widget::text::caption(label)
                         .wrapping(Wrapping::None)
-                        .width(Length::Fixed(NET_KEY_WIDTH)),
+                        .width(Length::Fixed(DEVICE_KEY_WIDTH)),
                 )
                 .push(widget::text::caption(value).wrapping(Wrapping::WordOrGlyph))
         };
@@ -1601,9 +1602,9 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
             .push(
                 widget::text::caption(label)
                     .wrapping(Wrapping::None)
-                    .width(Length::Fixed(FACT_KEY_WIDTH)),
+                    .width(Length::Fixed(DEVICE_KEY_WIDTH)),
             )
-            .push(widget::text::caption(value).wrapping(Wrapping::None))
+            .push(widget::text::caption(value).wrapping(Wrapping::WordOrGlyph))
     };
 
     let of = |used: u64, total: u64| {
@@ -1644,7 +1645,39 @@ fn gpu_panel<'a>(card: &'a Card, name: Option<&GpuName>) -> Element<'a, Message>
         ),
     };
 
-    let mut list = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    let mut list = widget::column::with_capacity(8).spacing(spacing.space_xxxs);
+    let (core, memory) = card.clocks;
+    if let Some(mhz) = core {
+        list = list.push(line(
+            fl!("fact-gpu-core-clock"),
+            fl!("clock-mhz", value = mhz),
+        ));
+    }
+    if let Some(mhz) = memory {
+        list = list.push(line(
+            fl!("fact-gpu-memory-clock"),
+            fl!("clock-mhz", value = mhz),
+        ));
+    }
+    if let Some((used, limit)) = card.power {
+        let watts = |w: f32| fl!("power-w", value = format!("{w:.0}"));
+        let value = match limit {
+            Some(limit) => fl!(
+                "fact-mem-committed-value",
+                used = watts(used),
+                limit = watts(limit)
+            ),
+            None => watts(used),
+        };
+        list = list.push(line(fl!("fact-gpu-power"), value));
+    }
+    if let Some(fan) = card.fan {
+        let value = match fan {
+            Fan::Percent(share) => percent(share as f32 / 100.0),
+            Fan::Rpm(rpm) => fl!("fan-rpm", value = rpm),
+        };
+        list = list.push(line(fl!("fact-gpu-fan"), value));
+    }
     if let Some(chip) = name
         .map(|name| name.chip.as_str())
         .filter(|c| !c.is_empty())

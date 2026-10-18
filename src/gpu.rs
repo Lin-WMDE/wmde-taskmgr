@@ -54,9 +54,39 @@ pub struct Card {
     pub shared: Option<(u64, Option<u64>)>,
     /// Degrees Celsius. `None` for a card without a sensor of its own.
     pub temperature: Option<f32>,
+    /// Core and memory clock, megahertz.
+    pub clocks: (Option<u32>, Option<u32>),
+    /// Watts drawn, and the limit the card is held to where the driver says.
+    pub power: Option<(f32, Option<f32>)>,
+    pub fan: Option<Fan>,
     source: Source,
     /// The card's `hwmon` temperature input, found once at start-up.
     thermal: Option<PathBuf>,
+    /// Where the rest of its sensors are, found once at start-up.
+    sensors: Sensors,
+}
+
+/// How fast a card's fan turns: NVML says it as a share of the fan's top speed, `hwmon` in
+/// revolutions a minute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fan {
+    Percent(u32),
+    Rpm(u32),
+}
+
+/// The sensor files of a card that has no NVML: an AMD card's `hwmon`, an Intel card's clock.
+#[derive(Debug, Default)]
+struct Sensors {
+    /// Microwatts: `power1_average`, or `power1_input` on the kernels that report it there.
+    power: Option<PathBuf>,
+    /// Microwatts.
+    power_cap: Option<PathBuf>,
+    /// Hertz: `freq1_input` is the core (`sclk`), `freq2_input` the memory (`mclk`).
+    core_hz: Option<PathBuf>,
+    memory_hz: Option<PathBuf>,
+    fan_rpm: Option<PathBuf>,
+    /// Megahertz: an Intel card's actual clock, which it publishes outside `hwmon`.
+    core_mhz: Option<PathBuf>,
 }
 
 enum Source {
@@ -128,6 +158,7 @@ impl Gpus {
             let driver = link_basename(&link.join("driver")).unwrap_or_default();
             let source = source_for(&driver, &card_dir, &device);
             let thermal = hwmon_temperature(&device);
+            let sensors = sensors_for(&driver, &card_dir, &device);
             cards.push(Card {
                 node: name.into(),
                 driver: driver.into(),
@@ -138,8 +169,12 @@ impl Gpus {
                 memory_busy: None,
                 shared: None,
                 temperature: None,
+                clocks: (None, None),
+                power: None,
+                fan: None,
                 source,
                 thermal,
+                sensors,
             });
         }
         cards.sort_by_key(|card| card_number(&card.node));
@@ -211,14 +246,29 @@ impl Gpus {
                     *last = idle.map(|idle| (idle, now));
                 }
             }
-            card.temperature = match (&card.source, nvml.as_ref()) {
-                (Source::Nvml(handle), Some(nvml)) => nvml.temperature(*handle),
-                _ => card
-                    .thermal
-                    .as_deref()
-                    .and_then(|path| read_u64(path, buf))
-                    .map(|millidegrees| millidegrees as f32 / 1000.0),
-            };
+            if let (Source::Nvml(handle), Some(nvml)) = (&card.source, nvml.as_ref()) {
+                card.temperature = nvml.temperature(*handle);
+                card.clocks = nvml.clocks(*handle);
+                card.power = nvml.power(*handle);
+                card.fan = nvml.fan(*handle).map(Fan::Percent);
+            } else {
+                let sensors = &card.sensors;
+                let mut read = |path: &Option<PathBuf>| read_u64(path.as_deref()?, buf);
+                card.temperature = read(&card.thermal).map(|milli| milli as f32 / 1000.0);
+                let mhz = |hz: u64| u32::try_from(hz / 1_000_000).ok();
+                card.clocks = (
+                    read(&sensors.core_hz).and_then(mhz).or_else(|| {
+                        read(&sensors.core_mhz).and_then(|mhz| u32::try_from(mhz).ok())
+                    }),
+                    read(&sensors.memory_hz).and_then(mhz),
+                );
+                let watts = |micro: u64| micro as f32 / 1_000_000.0;
+                card.power = read(&sensors.power)
+                    .map(|used| (watts(used), read(&sensors.power_cap).map(watts)));
+                card.fan = read(&sensors.fan_rpm)
+                    .and_then(|rpm| u32::try_from(rpm).ok())
+                    .map(Fan::Rpm);
+            }
         }
 
         // An Intel card's share of the machine's memory has no counter of its own; it is
@@ -249,8 +299,12 @@ impl Card {
             memory_busy: None,
             shared: None,
             temperature: None,
+            clocks: (None, None),
+            power: None,
+            fan: None,
             source: Source::None,
             thermal: None,
+            sensors: Sensors::default(),
         }
     }
 }
@@ -304,6 +358,37 @@ fn idle_source(path: PathBuf) -> Source {
         Source::Idle { path, last: None }
     } else {
         Source::None
+    }
+}
+
+/// The sensor files a card publishes, where they exist.
+///
+/// `hwmon` under the PCI function covers `amdgpu` (and `nouveau`, `radeon`, which register a
+/// subset); the files are taken by name and kept only if they are there. An Intel card
+/// publishes its clock beside its idle counter instead.
+fn sensors_for(driver: &str, card_dir: &Path, device: &Path) -> Sensors {
+    let hwmon = std::fs::read_dir(device.join("hwmon"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .min();
+    let file = |name: &str| {
+        let path = hwmon.as_ref()?.join(name);
+        path.exists().then_some(path)
+    };
+    let present = |path: PathBuf| path.exists().then_some(path);
+    Sensors {
+        power: file("power1_average").or_else(|| file("power1_input")),
+        power_cap: file("power1_cap"),
+        core_hz: file("freq1_input"),
+        memory_hz: file("freq2_input"),
+        fan_rpm: file("fan1_input"),
+        core_mhz: match driver {
+            "i915" => present(card_dir.join("gt/gt0/rps_act_freq_mhz")),
+            "xe" => present(device.join("tile0/gt0/freq0/act_freq")),
+            _ => None,
+        },
     }
 }
 
@@ -545,6 +630,10 @@ const NVML_MEMORY_V2: c_uint = std::mem::size_of::<NvmlMemoryV2>() as c_uint | 2
 /// `NVML_TEMPERATURE_GPU`: the die.
 const NVML_TEMPERATURE_GPU: c_uint = 0;
 
+/// `nvmlClockType_t`: the graphics clock and the memory clock.
+const NVML_CLOCK_GRAPHICS: c_uint = 0;
+const NVML_CLOCK_MEM: c_uint = 2;
+
 /// NVIDIA's management library, opened at run time: the package does not depend on the
 /// driver, and a machine without an NVIDIA card never loads it.
 struct Nvml {
@@ -555,6 +644,10 @@ struct Nvml {
     /// Drivers from 510 on; an older one has only the first version.
     memory_info_v2: Option<unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryV2) -> c_int>,
     temperature: Option<unsafe extern "C" fn(NvmlDevice, c_uint, *mut c_uint) -> c_int>,
+    power_usage: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
+    power_limit: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
+    clock_info: Option<unsafe extern "C" fn(NvmlDevice, c_uint, *mut c_uint) -> c_int>,
+    fan_speed: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
     /// Last, so it is dropped after the functions taken from it.
     _lib: libloading::Library,
 }
@@ -585,6 +678,22 @@ impl Nvml {
                 .get(b"nvmlDeviceGetTemperature\0")
                 .ok()
                 .map(|symbol| *symbol);
+            let power_usage = lib
+                .get(b"nvmlDeviceGetPowerUsage\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let power_limit = lib
+                .get(b"nvmlDeviceGetEnforcedPowerLimit\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let clock_info = lib
+                .get(b"nvmlDeviceGetClockInfo\0")
+                .ok()
+                .map(|symbol| *symbol);
+            let fan_speed = lib
+                .get(b"nvmlDeviceGetFanSpeed\0")
+                .ok()
+                .map(|symbol| *symbol);
             let rc = init();
             if rc != NVML_SUCCESS {
                 tracing::warn!(
@@ -600,6 +709,10 @@ impl Nvml {
                 memory_info,
                 memory_info_v2,
                 temperature,
+                power_usage,
+                power_limit,
+                clock_info,
+                fan_speed,
                 _lib: lib,
             })
         }
@@ -639,6 +752,47 @@ impl Nvml {
         // SAFETY: as for `utilization`.
         let rc = unsafe { (self.memory_info)(device as NvmlDevice, &mut memory) };
         (rc == NVML_SUCCESS && memory.total > 0).then_some((memory.used, memory.total))
+    }
+
+    /// One `unsigned int` out of a call that fills one.
+    fn read_uint(
+        call: Option<unsafe extern "C" fn(NvmlDevice, *mut c_uint) -> c_int>,
+        device: usize,
+    ) -> Option<u32> {
+        let call = call?;
+        let mut value: c_uint = 0;
+        // SAFETY: a handle NVML gave out and a place for the reading.
+        let rc = unsafe { call(device as NvmlDevice, &mut value) };
+        (rc == NVML_SUCCESS).then_some(value)
+    }
+
+    /// Watts drawn and the limit enforced on the card; NVML reports both in milliwatts.
+    fn power(&self, device: usize) -> Option<(f32, Option<f32>)> {
+        let watts = |milli: u32| milli as f32 / 1000.0;
+        let used = Self::read_uint(self.power_usage, device)?;
+        Some((
+            watts(used),
+            Self::read_uint(self.power_limit, device).map(watts),
+        ))
+    }
+
+    /// Core and memory clocks in megahertz.
+    fn clocks(&self, device: usize) -> (Option<u32>, Option<u32>) {
+        let Some(call) = self.clock_info else {
+            return (None, None);
+        };
+        let clock = |kind: c_uint| {
+            let mut mhz: c_uint = 0;
+            // SAFETY: a handle NVML gave out, a clock type it defines, and a place for it.
+            let rc = unsafe { call(device as NvmlDevice, kind, &mut mhz) };
+            (rc == NVML_SUCCESS).then_some(mhz)
+        };
+        (clock(NVML_CLOCK_GRAPHICS), clock(NVML_CLOCK_MEM))
+    }
+
+    /// The fan as a share of its top speed, in percent.
+    fn fan(&self, device: usize) -> Option<u32> {
+        Self::read_uint(self.fan_speed, device)
     }
 
     /// The die temperature in degrees Celsius.
@@ -1001,6 +1155,47 @@ mod tests {
         assert_eq!(card.temperature, Some(38.5));
         // A temperature, and still no utilization: the two are separate sources.
         assert_eq!(card.busy, None);
+    }
+
+    /// An AMD card's sensors in the units `hwmon` gives them: microwatts, hertz, RPM.
+    #[test]
+    fn amdgpu_reads_power_clocks_and_fan() {
+        let sys = Sysfs::new("hwmon-amd-power");
+        let device = sys.card("card0", "0000:03:00.0", "0x030000", "amdgpu");
+        let hwmon = device.join("hwmon/hwmon4");
+        fs::create_dir_all(&hwmon).unwrap();
+        for (file, value) in [
+            ("power1_average", "45000000"),
+            ("power1_cap", "120000000"),
+            ("freq1_input", "1800000000"),
+            ("freq2_input", "875000000"),
+            ("fan1_input", "1200"),
+        ] {
+            fs::write(hwmon.join(file), format!("{value}\n")).unwrap();
+        }
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.sample(Instant::now());
+        let card = &gpus.cards()[0];
+        assert_eq!(card.power, Some((45.0, Some(120.0))));
+        assert_eq!(card.clocks, (Some(1800), Some(875)));
+        assert_eq!(card.fan, Some(Fan::Rpm(1200)));
+    }
+
+    /// Read off `.131` with its HD 4600: the clock beside the idle counter, nothing else.
+    #[test]
+    fn intel_reads_its_clock_and_nothing_more() {
+        let sys = Sysfs::new("i915-clock");
+        sys.card("card1", "0000:00:02.0", "0x030000", "i915");
+        let gt = sys.drm().join("card1/gt/gt0");
+        fs::create_dir_all(&gt).unwrap();
+        fs::write(gt.join("rps_act_freq_mhz"), "350\n").unwrap();
+        let mut gpus = Gpus::scan(&sys.drm(), || None);
+        gpus.proc = sys.proc();
+        gpus.sample(Instant::now());
+        let card = &gpus.cards()[0];
+        assert_eq!(card.clocks, (Some(350), None));
+        assert_eq!(card.power, None);
+        assert_eq!(card.fan, None);
     }
 
     #[test]
