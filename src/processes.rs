@@ -435,19 +435,9 @@ fn percent(share: f32) -> String {
     format!("{:.1}%", (share * 100.0).clamp(0.0, 100.0))
 }
 
-/// KiB from `/proc` as the largest unit that leaves a number worth reading.
+/// KiB from `/proc` as a size, in the format the whole stack shares.
 fn size(kib: u64) -> String {
-    let value = kib as f64;
-    if value >= 1024.0 * 1024.0 {
-        fl!(
-            "size-gib",
-            value = format!("{:.1}", value / (1024.0 * 1024.0))
-        )
-    } else if value >= 1024.0 {
-        fl!("size-mib", value = format!("{:.1}", value / 1024.0))
-    } else {
-        fl!("size-kib", value = format!("{value:.0}"))
-    }
+    cosmic::units::size(kib.saturating_mul(1024))
 }
 
 /// Bytes per second, read and written added together. A missing pair is a dash rather than a
@@ -456,22 +446,7 @@ fn rate(disk: Option<[f64; 2]>) -> String {
     let Some([read, written]) = disk else {
         return fl!("no-value");
     };
-    let value = read + written;
-    if value >= 1024.0 * 1024.0 * 1024.0 {
-        fl!(
-            "rate-gib",
-            value = format!("{:.1}", value / (1024.0 * 1024.0 * 1024.0))
-        )
-    } else if value >= 1024.0 * 1024.0 {
-        fl!(
-            "rate-mib",
-            value = format!("{:.1}", value / (1024.0 * 1024.0))
-        )
-    } else if value >= 1024.0 {
-        fl!("rate-kib", value = format!("{:.1}", value / 1024.0))
-    } else {
-        fl!("rate-b", value = format!("{value:.0}"))
-    }
+    cosmic::units::rate(read + written)
 }
 
 #[cfg(test)]
@@ -548,10 +523,17 @@ mod tests {
         );
     }
 
+    // The words and the decimal separator depend on the locale of whoever runs the tests, so
+    // these only pin what this module adds to `cosmic::units`: the KiB the kernel counts in.
     #[test]
-    fn sizes_climb_through_the_units() {
-        assert!(size(512).ends_with("КіБ") || size(512).ends_with("KiB"));
-        assert!(size(2048).contains("2.0"));
-        assert!(size(3 * 1024 * 1024).contains("3.0"));
+    fn sizes_from_proc_are_counted_in_kib() {
+        assert_eq!(size(512), cosmic::units::size(512 * 1024));
+        assert_eq!(size(3 * 1024 * 1024), cosmic::units::size(3 << 30));
+        assert_eq!(size(u64::MAX), cosmic::units::size(u64::MAX));
+    }
+
+    #[test]
+    fn disk_rate_adds_reads_and_writes() {
+        assert_eq!(rate(Some([1536.0, 512.0])), cosmic::units::rate(2048.0));
     }
 }

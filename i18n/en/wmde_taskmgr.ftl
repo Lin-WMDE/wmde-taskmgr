@@ -26,16 +26,6 @@ group-desktop-shell = Desktop shell
 end-task = End task
 kill-task = Force quit
 
-size-b = { $value } B
-size-kib = { $value } KiB
-size-mib = { $value } MiB
-size-gib = { $value } GiB
-
-rate-b = { $value } B/s
-rate-kib = { $value } KiB/s
-rate-mib = { $value } MiB/s
-rate-gib = { $value } GiB/s
-
 # Which login this is. A row on the users page is one login, not one account.
 session-desktop = Desktop
 session-console = Console { $tty }

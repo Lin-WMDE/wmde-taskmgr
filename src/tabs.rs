@@ -11,6 +11,10 @@
 //! the title bar. The title-bar variant drops the active-tab underline because the strip merges
 //! into the menu row painted the same colour, and an underline there would only draw a line
 //! across that seam. There is no menu row here, so the hint stays.
+//!
+//! In a window without focus every tab takes the dimmed tone of the rest of the title bar
+//! (`header_unfocused_color`), so the whole bar dims as one; the tab under the pointer stays
+//! bright.
 
 use cosmic::iced::{self, Color};
 use cosmic::theme::style;
@@ -21,14 +25,20 @@ fn body(theme: &cosmic::Theme) -> Color {
     Color::from(theme.cosmic().primary(theme.transparent).base)
 }
 
+/// `focused` is whether the main window has focus, see `Core::main_window_focused`.
 #[must_use]
-pub fn style() -> style::SegmentedButton {
+pub fn style(focused: bool) -> style::SegmentedButton {
     style::SegmentedButton::Custom(Box::new(move |theme| {
         let cosmic = theme.cosmic();
         let rad = cosmic.corner_radii.radius_s;
         let top_round = iced::border::Radius::from([rad[0], rad[1], 0.0, 0.0]);
         let body = body(theme);
         let on = Color::from(cosmic.background(theme.transparent).on);
+        let ink = if focused {
+            on
+        } else {
+            cosmic::widget::header_unfocused_color(theme)
+        };
 
         // Nudge the fill towards the text colour - lighter in a dark theme, darker in a light
         // one. A translucent copy of the fill would have made the ACTIVE tab look weaker under
@@ -55,7 +65,7 @@ pub fn style() -> style::SegmentedButton {
             first: item(top_round),
             middle: item(top_round),
             last: item(top_round),
-            text_color: on,
+            text_color: ink,
         };
         Appearance {
             background: None,
@@ -70,7 +80,13 @@ pub fn style() -> style::SegmentedButton {
                 background: None,
                 // Dim the same ink rather than switch to component.on, which is DARKER than
                 // background.on in the light palette and would invert the emphasis there.
-                text_color: Color { a: 0.65, ..on },
+                // Without focus the tone is dimmed already, and only the fill tells the
+                // active tab.
+                text_color: if focused {
+                    Color { a: 0.65, ..on }
+                } else {
+                    ink
+                },
                 ..active
             },
             hover: ItemStatusAppearance {

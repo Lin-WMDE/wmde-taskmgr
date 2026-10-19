@@ -2206,35 +2206,13 @@ fn uptime() -> String {
     format!("{d:02}:{h:02}:{m:02}:{s:02}")
 }
 
-/// Bytes as the largest unit that leaves a number worth reading.
+/// Bytes in the format the whole stack shares.
 fn size(bytes: u64) -> String {
-    let value = bytes as f64;
-    if value >= 1024.0 * 1024.0 * 1024.0 {
-        fl!(
-            "size-gib",
-            value = format!("{:.1}", value / (1024.0 * 1024.0 * 1024.0))
-        )
-    } else if value >= 1024.0 * 1024.0 {
-        fl!(
-            "size-mib",
-            value = format!("{:.0}", value / (1024.0 * 1024.0))
-        )
-    } else {
-        fl!("size-kib", value = format!("{:.0}", value / 1024.0))
-    }
+    cosmic::units::size(bytes)
 }
 
 fn rate(per_second: f64) -> String {
-    if per_second >= 1024.0 * 1024.0 {
-        fl!(
-            "rate-mib",
-            value = format!("{:.1}", per_second / (1024.0 * 1024.0))
-        )
-    } else if per_second >= 1024.0 {
-        fl!("rate-kib", value = format!("{:.0}", per_second / 1024.0))
-    } else {
-        fl!("rate-b", value = format!("{per_second:.0}"))
-    }
+    cosmic::units::rate(per_second)
 }
 
 #[cfg(test)]

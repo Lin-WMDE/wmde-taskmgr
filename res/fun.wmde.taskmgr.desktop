@@ -1,5 +1,6 @@
 [Desktop Entry]
-Name=WMDE Task Manager
+Name=Task Manager
+Name[uk]=Диспетчер завдань
 Comment=Running processes and system load
 Comment[uk]=Запущені процеси та навантаження системи
 Exec=wmde-taskmgr
@@ -8,4 +9,5 @@ Type=Application
 StartupNotify=true
 Icon=fun.wmde.taskmgr
 Categories=System;Monitor;
-Keywords=Process;Task;Monitor;Performance;CPU;Memory;
+Keywords=WMDE;Process;Task;Monitor;Performance;CPU;Memory;
+Keywords[uk]=WMDE;Процес;Завдання;Монітор;Продуктивність;Процесор;Памʼять;

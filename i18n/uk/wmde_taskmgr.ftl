@@ -26,16 +26,6 @@ group-desktop-shell = Оболонка стільниці
 end-task = Зняти завдання
 kill-task = Завершити примусово
 
-size-b = { $value } Б
-size-kib = { $value } КіБ
-size-mib = { $value } МіБ
-size-gib = { $value } ГіБ
-
-rate-b = { $value } Б/с
-rate-kib = { $value } КіБ/с
-rate-mib = { $value } МіБ/с
-rate-gib = { $value } ГіБ/с
-
 # Який це вхід. Рядок вкладки користувачів - один вхід, а не один обліковий запис.
 session-desktop = Робочий стіл
 session-console = Консоль { $tty }

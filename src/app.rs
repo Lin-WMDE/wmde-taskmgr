@@ -461,7 +461,7 @@ impl cosmic::Application for App {
         vec![
             widget::tab_bar::horizontal(&self.tabs)
                 .button_height(32)
-                .style(crate::tabs::style())
+                .style(crate::tabs::style(self.core().main_window_focused()))
                 .on_activate(Message::Tab)
                 .width(Length::Shrink)
                 .into(),
